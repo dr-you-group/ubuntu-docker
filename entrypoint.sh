@@ -133,10 +133,16 @@ for item in "${USERS_LIST[@]}"; do
 
   setup_fcitx5_for_user "$username"
 
-  chown -R "${username}:${username}" "/home/${username}" "/workspace/${username}"
-  chown -h "${username}:${username}" "/home/${username}/workspace" "/home/${username}/shared" || true
-
-  chmod 700 "/home/${username}" "/workspace/${username}"
+  mkdir -p "/home/${username}/.config/xfce4"
+  cat > "/home/${username}/.config/xfce4/helpers.rc" <<'EOF'
+TerminalEmulator=xfce4-terminal
+EOF
+    chown -R "${username}:${username}" "/home/${username}/.config/xfce4"
+  
+    chown -R "${username}:${username}" "/home/${username}" "/workspace/${username}"
+    chown -h "${username}:${username}" "/home/${username}/workspace" "/home/${username}/shared" || true
+  
+    chmod 700 "/home/${username}" "/workspace/${username}"
 done
 
 chown root:labusers /workspace/shared

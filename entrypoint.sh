@@ -164,36 +164,59 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
   tailscaled \
     --tun=userspace-networking \
     --state=/var/lib/tailscale/tailscaled.state \
-    --socket="${TS_SOCKET}" &
+    --socket="${TS_SOCKET}" \
+    > /var/log/tailscaled.log 2>&1 &
 
-  sleep 3
+  TAILSCALED_PID=$!
+  sleep 5
 
-  ts() {
-    tailscale --socket="${TS_SOCKET}" "$@"
-  }
+  if ! kill -0 "$TAILSCALED_PID" 2>/dev/null; then
+    echo "WARNING: tailscaled exited early. Container will continue without Tailscale."
+    echo "----- /var/log/tailscaled.log -----"
+    cat /var/log/tailscaled.log || true
+  else
+    ts() {
+      tailscale --socket="${TS_SOCKET}" "$@"
+    }
 
-  ts up \
-    --authkey="${TS_AUTHKEY}" \
-    --hostname="${TS_HOSTNAME:-dcp-ubuntu}" \
-    --accept-dns=false \
-    ${TS_EXTRA_ARGS:-}
+    echo "Running tailscale up..."
 
-  # Reset old Serve config, then expose only inside tailnet
-  ts serve reset || true
+    if ! ts up \
+      --authkey="${TS_AUTHKEY}" \
+      --hostname="${TS_HOSTNAME:-dcp-ubuntu}" \
+      --accept-dns=false \
+      ${TS_EXTRA_ARGS:-} \
+      > /var/log/tailscale-up.log 2>&1; then
 
-  # RDP: tailnet port 3389 -> container localhost:3389
-  ts serve --yes --bg --tcp=3389 tcp://localhost:3389 || true
+      echo "WARNING: tailscale up failed. Container will continue without Tailscale."
+      echo "----- /var/log/tailscale-up.log -----"
+      cat /var/log/tailscale-up.log || true
 
-  # SSH: tailnet port 2222 -> container localhost:22
-  ts serve --yes --bg --tcp=2222 tcp://localhost:22 || true
+    else
+      echo "Tailscale up succeeded."
 
-  echo ""
-  echo "Tailscale IP:"
-  ts ip -4 || true
+      ts serve reset > /var/log/tailscale-serve.log 2>&1 || true
 
-  echo ""
-  echo "Tailscale Serve status:"
-  ts serve status || true
+      if ! ts serve --yes --bg --tcp=3389 tcp://127.0.0.1:3389 >> /var/log/tailscale-serve.log 2>&1; then
+        echo "WARNING: Tailscale Serve failed for RDP 3389."
+      fi
+
+      if ! ts serve --yes --bg --tcp=2222 tcp://127.0.0.1:22 >> /var/log/tailscale-serve.log 2>&1; then
+        echo "WARNING: Tailscale Serve failed for SSH 2222."
+      fi
+
+      echo ""
+      echo "Tailscale IP:"
+      ts ip -4 || true
+
+      echo ""
+      echo "Tailscale Serve status:"
+      ts serve status || true
+
+      echo "----- /var/log/tailscale-serve.log -----"
+      cat /var/log/tailscale-serve.log || true
+    fi
+  fi
 else
   echo "TS_AUTHKEY is not set. Tailscale was not started."
 fi

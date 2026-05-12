@@ -51,7 +51,6 @@ docker run -d \
   --shm-size=64g \
   -e TS_AUTHKEY="${TS_AUTHKEY}" \
   -e TS_HOSTNAME="${TS_HOSTNAME:-dcp-ubuntu}" \
-  -e TS_EXTRA_ARGS="${TS_EXTRA_ARGS:-}" \
   -e LABADMIN_PASSWORD="${LABADMIN_PASSWORD:-}" \
   -e YOUNWOO_PASSWORD="${YOUNWOO_PASSWORD:-}" \
   -e HANJAE_PASSWORD="${HANJAE_PASSWORD:-}" \

@@ -7,7 +7,7 @@ ENV LC_ALL=en_US.UTF-8
 
 RUN apt-get update && apt-get install -y \
     sudo curl wget ca-certificates gnupg openssl \
-    xfce4 xfce4-goodies \
+    xfce4 xfce4-goodies xfce4-terminal xterm exo-utils \
     xrdp xorgxrdp dbus-x11 dbus x11-xserver-utils xauth \
     openssh-server \
     fcitx5 fcitx5-hangul fcitx5-config-qt im-config \

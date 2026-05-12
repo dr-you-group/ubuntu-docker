@@ -19,12 +19,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Tailscale install
-RUN install -m 0755 -d /etc/apt/keyrings && \
+RUN mkdir -p --mode=0755 /usr/share/keyrings && \
     curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg \
-      -o /etc/apt/keyrings/tailscale-archive-keyring.gpg && \
+      -o /usr/share/keyrings/tailscale-archive-keyring.gpg && \
     curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list \
       -o /etc/apt/sources.list.d/tailscale.list && \
-    apt-get update && apt-get install -y tailscale && \
+    apt-get update && \
+    apt-get install -y tailscale && \
     rm -rf /var/lib/apt/lists/*
 
 # Global Fcitx5 environment for Korean input

@@ -1,6 +1,5 @@
-export TS_AUTHKEY='ksfZDgY1k821CNTRL-gQtB4EYtj9dbAkmqf6g4AdqVbaNJbbyx'
+export TS_AUTHKEY='tskey-auth-knNrH8P5GB21CNTRL-aQrE4b9HAs6RktjWUSRas6fvy2e9m9rZ'
 export TS_HOSTNAME='dcp-ubuntu'
-export TS_EXTRA_ARGS='aisi'
 export LABADMIN_PASSWORD='yuhs2022'
 export YOUNWOO_PASSWORD='yuhs2022'
 export HANJAE_PASSWORD='yuhs2022'

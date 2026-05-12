@@ -182,10 +182,10 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
     echo "Running tailscale up..."
 
     if ! ts up \
-      --authkey="${TS_AUTHKEY}" \
-      --hostname="${TS_HOSTNAME:-dcp-ubuntu}" \
-      --accept-dns=false \
-      ${TS_EXTRA_ARGS:-} \
+        --authkey="${TS_AUTHKEY}" \
+        --hostname="${TS_HOSTNAME:-dcp-ubuntu}" \
+        --accept-dns=false \
+        --reset
       > /var/log/tailscale-up.log 2>&1; then
 
       echo "WARNING: tailscale up failed. Container will continue without Tailscale."

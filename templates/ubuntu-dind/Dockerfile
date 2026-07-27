@@ -14,6 +14,7 @@ ENV LANG=en_US.UTF-8 \
     TZ=Asia/Seoul \
     PATH=/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# im-config must not select systemd-cat when the container has no journal socket.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -76,6 +77,12 @@ RUN apt-get update \
         xauth \
         xorgxrdp \
         xrdp \
+    && sed -i \
+        's|if \[ -e /usr/bin/systemd-cat \] ; then|if [ -e /usr/bin/systemd-cat ] \&\& [ -S /run/systemd/journal/socket ] ; then|' \
+        /usr/share/im-config/initializer \
+    && grep -Fqx \
+        'if [ -e /usr/bin/systemd-cat ] && [ -S /run/systemd/journal/socket ] ; then' \
+        /usr/share/im-config/initializer \
     && locale-gen en_US.UTF-8 ko_KR.UTF-8 \
     && ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
     && printf '%s\n' "${TZ}" > /etc/timezone \

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly project_path=__PROJECT_PATH_SHELL__
+readonly account_name='__ACCOUNT_NAME__'
+readonly cuda_image='__CUDA_IMAGE__'
+
+cd "${project_path}"
+
+if [[ ! -f compose.override.yaml ]]; then
+    printf 'ERROR: GPU override is not enabled for this environment.\n' >&2
+    exit 1
+fi
+
+printf '%s\n' '=== Desktop GPU ==='
+docker compose exec -T desktop nvidia-smi
+
+printf '%s\n' '=== DinD service GPU ==='
+docker compose exec -T docker nvidia-smi
+
+printf '%s\n' '=== Nested DinD CUDA container ==='
+docker compose exec -T -u "${account_name}" desktop \
+    docker run --rm --gpus all "${cuda_image}" nvidia-smi
+
+printf 'GPU verification succeeded with %s\n' "${cuda_image}"

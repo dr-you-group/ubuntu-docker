@@ -1,0 +1,73 @@
+# __ENVIRONMENT_NAME__ Ubuntu Environment
+
+Ubuntu 26.04 desktop with RDP, SSH, persistent storage, and an isolated Docker-in-Docker engine.
+
+## Connect
+
+| Service | Address | User |
+| --- | --- | --- |
+| SSH | `__HOST_ADDRESS__:__SSH_PORT__` | `__ACCOUNT_NAME__` |
+| RDP | `__HOST_ADDRESS__:__RDP_PORT__` | `__ACCOUNT_NAME__` |
+
+```bash
+ssh -p __SSH_PORT__ __ACCOUNT_NAME__@__HOST_ADDRESS__
+```
+
+Open the generated `.rdp` file for desktop access. The password is the one entered during creation; it is not stored in this README or the RDP file. Host port `3389` is not used.
+
+## Use Docker
+
+Run these commands after connecting by SSH or RDP:
+
+```bash
+docker version
+docker info
+docker run --rm hello-world
+docker compose version
+```
+
+The Docker daemon is isolated in a separate DinD service and is available only through mutual TLS. Port `2376` is not published to the host.
+
+## Storage and resources
+
+- Home: `__HOME_STORAGE__`
+- Workspace: `__WORKSPACE_STORAGE__`
+
+| Service | CPU | Memory |
+| --- | --- | --- |
+| Desktop | `__DESKTOP_CPUS__` | `__DESKTOP_MEMORY__` |
+| DinD and inner containers | `__DIND_CPUS__` | `__DIND_MEMORY__` |
+
+## NVIDIA GPU
+
+- Host platform: `__HOST_PLATFORM__`
+- GPU status: `__GPU_STATUS__`
+- CUDA test image: `__CUDA_IMAGE__`
+
+Run the GPU check:
+
+```text
+__GPU_TEST_COMMAND__
+```
+
+The NVIDIA kernel driver must be installed on the host. Native Ubuntu creation requires the nested CUDA check to pass. Docker Desktop WSL2 keeps the environment running with a warning if only the nested GPU check fails.
+
+## Manage
+
+```text
+cd __PROJECT_PATH__
+docker compose up -d
+docker compose ps
+docker compose logs -f
+docker compose down
+```
+
+Reapply the generated firewall policy with administrator/root privileges:
+
+```text
+__FIREWALL_COMMAND__
+```
+
+Do not run `docker compose down -v`; it deletes DinD data and SSH host-key volumes.
+
+Firefox is available as `firefox` or `www-browser`. Toggle Korean input with the Hangul key, `Shift+Space`, or `Ctrl+Space`.

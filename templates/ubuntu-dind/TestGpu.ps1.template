@@ -1,0 +1,52 @@
+#Requires -Version 5.1
+
+[CmdletBinding()]
+param(
+    [switch]$RequireNested
+)
+
+$ErrorActionPreference = 'Stop'
+$projectPath = __PROJECT_PATH_POWERSHELL__
+$accountName = '__ACCOUNT_NAME__'
+$cudaImage = '__CUDA_IMAGE__'
+
+Push-Location $projectPath
+try {
+    if (-not (Test-Path -LiteralPath '.\compose.override.yaml')) {
+        throw 'GPU override is not enabled for this environment.'
+    }
+
+    docker compose exec -T desktop nvidia-smi
+    if ($LASTEXITCODE -ne 0) { throw 'Desktop GPU verification failed.' }
+
+    docker compose exec -T docker nvidia-smi
+    if ($LASTEXITCODE -ne 0) { throw 'DinD service GPU verification failed.' }
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        docker compose exec -T -u $accountName desktop `
+            docker run --rm --gpus all $cudaImage nvidia-smi
+        $nestedExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if ($nestedExitCode -ne 0) {
+        if ($RequireNested) {
+            throw 'Nested DinD CUDA verification failed.'
+        }
+        Write-Warning @"
+Direct desktop/DinD GPU checks passed, but the nested DinD CUDA check failed.
+Docker Desktop WSL2 does not officially guarantee nested GPU passthrough. Use native Ubuntu when nested CUDA is required.
+"@
+        Write-Host 'Direct GPU verification succeeded; nested DinD GPU is unavailable.'
+        return
+    }
+
+    Write-Host "Direct and nested GPU verification succeeded with $cudaImage"
+}
+finally {
+    Pop-Location
+}

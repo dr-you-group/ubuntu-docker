@@ -1,8 +1,0 @@
-export TS_AUTHKEY='tskey-auth-k3KzQsJYdM11CNTRL-hvfkBEbNw34tuDdBS4ig34ADVczJsfZ3'
-export TS_HOSTNAME='dcp-ubuntu'
-export LABADMIN_PASSWORD='yuhs2022'
-export YOUNWOO_PASSWORD='yuhs2022'
-export HANJAE_PASSWORD='yuhs2022'
-export MINSUNG_PASSWORD='yuhs2022'
-export CHANGHOON_PASSWORD='yuhs2022'
-export JIWOO_PASSWORD='yuhs2022'

@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+.environment.json
+README.md
+*.rdp
+Configure*Firewall.ps1
+configure_*_firewall.sh
+TestGpu.ps1
+test_gpu.sh
+secrets
+secrets/**

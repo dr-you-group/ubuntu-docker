@@ -1,0 +1,26 @@
+# Generated environments and runtime directories
+/*/
+!/templates/
+
+# Credentials and host/runtime state
+**/.env
+**/.env.*
+!**/.env.example
+**/secrets/
+**/*password*.txt
+**/auth.json
+**/id_rsa*
+**/id_ed25519*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.kdbx
+**/.bash_history
+
+# Generated connection and runtime files
+**/.environment.json
+**/*.rdp
+**/compose.override.yaml
+**/*.log
+**/*.sqlite*

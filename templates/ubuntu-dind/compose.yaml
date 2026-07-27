@@ -1,0 +1,121 @@
+name: ubuntu-dind-${ENVIRONMENT_NAME}
+
+services:
+  desktop:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ENVIRONMENT_NAME: ${ENVIRONMENT_NAME}
+        ACCOUNT_NAME: ${ACCOUNT_NAME}
+        ACCOUNT_UID: ${ACCOUNT_UID:-1001}
+        ACCOUNT_GID: ${ACCOUNT_GID:-1001}
+        DOCKER_VERSION: ${DOCKER_VERSION}
+    # A unique tag keeps the previous image available for automatic rollback.
+    image: ${ENVIRONMENT_NAME}-ubuntu-dind:${IMAGE_TAG}
+    hostname: ${ENVIRONMENT_NAME}
+    restart: unless-stopped
+    cpus: "${DESKTOP_CPUS}"
+    mem_limit: ${DESKTOP_MEMORY}
+    shm_size: "1gb"
+    ports:
+      - "127.0.0.1:${SSH_PORT}:22"
+      - "${HOST_ADDRESS}:${SSH_PORT}:22"
+      # Host port 3389 is reserved. RDP_PORT is validated as 3390 or higher.
+      - "${HOST_ADDRESS}:${RDP_PORT}:3389"
+    environment:
+      ACCOUNT_NAME: ${ACCOUNT_NAME}
+      ACCOUNT_PASSWORD_FILE: /run/secrets/login_password
+      HOST_PLATFORM: ${HOST_PLATFORM:-windows}
+      GPU_ENABLED: ${GPU_ENABLED:-0}
+      DOCKER_HOST: tcp://docker:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: /home/${ACCOUNT_NAME}/.docker/dind-certs
+      TZ: ${TZ:-Asia/Seoul}
+    secrets:
+      - login_password
+    volumes:
+      - type: bind
+        source: ${STORAGE_ROOT}/home
+        target: /home/${ACCOUNT_NAME}
+      - type: bind
+        source: ${STORAGE_ROOT}/workspace
+        target: /workspace
+      - type: volume
+        source: dind_client_certs
+        target: /certs/client
+        read_only: true
+      - type: volume
+        source: ssh_host_keys
+        target: /etc/ssh/host_keys
+    depends_on:
+      docker:
+        condition: service_healthy
+    networks:
+      - environment
+
+  docker:
+    build:
+      context: .
+      dockerfile: Dockerfile.dind
+      args:
+        DOCKER_VERSION: ${DOCKER_VERSION}
+        ENABLE_GPU: ${GPU_ENABLED:-0}
+        NVIDIA_CONTAINER_TOOLKIT_VERSION: ${NVIDIA_CONTAINER_TOOLKIT_VERSION:-1.19.1-1}
+    image: ${ENVIRONMENT_NAME}-dind:${IMAGE_TAG}
+    hostname: docker
+    restart: unless-stopped
+    privileged: true
+    cpus: "${DIND_CPUS}"
+    mem_limit: ${DIND_MEMORY}
+    environment:
+      DOCKER_TLS_CERTDIR: /certs
+      GPU_ENABLED: ${GPU_ENABLED:-0}
+    volumes:
+      - type: volume
+        source: dind_data
+        target: /var/lib/docker
+      - type: volume
+        source: dind_ca_certs
+        target: /certs/ca
+      - type: volume
+        source: dind_client_certs
+        target: /certs/client
+      - type: volume
+        source: dind_server_certs
+        target: /certs/server
+      # Mount at identical paths so inner `docker run -v` paths behave naturally.
+      - type: bind
+        source: ${STORAGE_ROOT}/home
+        target: /home/${ACCOUNT_NAME}
+      - type: bind
+        source: ${STORAGE_ROOT}/workspace
+        target: /workspace
+    healthcheck:
+      test: ["CMD-SHELL", "docker info >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      start_period: 30s
+      retries: 24
+    networks:
+      - environment
+
+secrets:
+  login_password:
+    file: ./secrets/login_password.txt
+
+volumes:
+  dind_data:
+    name: ${ENVIRONMENT_NAME}_dind_data
+  dind_ca_certs:
+    name: ${ENVIRONMENT_NAME}_dind_ca_certs
+  dind_client_certs:
+    name: ${ENVIRONMENT_NAME}_dind_client_certs
+  dind_server_certs:
+    name: ${ENVIRONMENT_NAME}_dind_server_certs
+  ssh_host_keys:
+    name: ${ENVIRONMENT_NAME}_ssh_host_keys
+
+networks:
+  environment:
+    name: ${ENVIRONMENT_NAME}_environment

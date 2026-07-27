@@ -1,0 +1,77 @@
+FROM ubuntu:26.04
+
+ARG DOCKER_VERSION=29.6.2
+ARG ENABLE_GPU=0
+ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.19.1-1
+
+LABEL org.opencontainers.image.title="Ubuntu Docker-in-Docker engine"
+LABEL org.opencontainers.image.description="Isolated Docker Engine with mutual TLS"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    DOCKER_TLS_CERTDIR=/certs \
+    TZ=Asia/Seoul \
+    PATH=/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+        openssl \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        -o /etc/apt/keyrings/docker.asc \
+    && test "$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc \
+        | awk -F: '$1 == "fpr" { print $10; exit }')" = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88" \
+    && printf '%s\n' \
+        'Types: deb' \
+        'URIs: https://download.docker.com/linux/ubuntu' \
+        'Suites: resolute' \
+        'Components: stable' \
+        "Architectures: $(dpkg --print-architecture)" \
+        'Signed-By: /etc/apt/keyrings/docker.asc' \
+        > /etc/apt/sources.list.d/docker.sources \
+    && printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod 0755 /usr/sbin/policy-rc.d \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        "docker-ce=5:${DOCKER_VERSION}-1~ubuntu.26.04~resolute" \
+        "docker-ce-cli=5:${DOCKER_VERSION}-1~ubuntu.26.04~resolute" \
+        containerd.io \
+    && if [ "${ENABLE_GPU}" = "1" ]; then \
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+            -o /tmp/nvidia-container-toolkit.gpg \
+        && gpg --batch --yes --dearmor \
+            --output /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+            /tmp/nvidia-container-toolkit.gpg \
+        && curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+            -o /tmp/nvidia-container-toolkit.list \
+        && sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+            /tmp/nvidia-container-toolkit.list \
+            > /etc/apt/sources.list.d/nvidia-container-toolkit.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends \
+            "nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
+            "nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
+            "libnvidia-container-tools=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
+            "libnvidia-container1=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
+        && rm -f /tmp/nvidia-container-toolkit.gpg /tmp/nvidia-container-toolkit.list; \
+    fi \
+    && rm -f /usr/sbin/policy-rc.d \
+    && dockerd --version \
+    && docker --version \
+    && if [ "${ENABLE_GPU}" = "1" ]; then nvidia-ctk --version; fi \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY dind_entrypoint.sh /usr/local/sbin/dind_entrypoint.sh
+RUN chmod 0755 /usr/local/sbin/dind_entrypoint.sh
+
+VOLUME ["/var/lib/docker"]
+EXPOSE 2376
+
+HEALTHCHECK --interval=5s --timeout=5s --start-period=30s --retries=24 \
+    CMD docker info >/dev/null 2>&1 || exit 1
+
+ENTRYPOINT ["/usr/local/sbin/dind_entrypoint.sh"]
+CMD ["dockerd", "--host=unix:///var/run/docker.sock", "--host=tcp://0.0.0.0:2376", "--tlsverify", "--tlscacert=/certs/ca/cert.pem", "--tlscert=/certs/server/cert.pem", "--tlskey=/certs/server/key.pem", "--storage-driver=overlay2"]

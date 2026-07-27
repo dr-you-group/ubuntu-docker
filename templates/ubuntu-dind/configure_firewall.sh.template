@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly environment_name='__ENVIRONMENT_NAME__'
+readonly local_address='__HOST_ADDRESS__'
+readonly remote_subnet='__REMOTE_SUBNET__'
+readonly ssh_port=__SSH_PORT__
+readonly rdp_port=__RDP_PORT__
+readonly rule_chain='__FIREWALL_CHAIN__'
+readonly installed_script="/usr/local/lib/dockervm/configure_${environment_name//-/_}_firewall.sh"
+readonly legacy_installed_script="/usr/local/lib/dockervm/${environment_name}-firewall.sh"
+readonly unit_file="/etc/systemd/system/dockervm-${environment_name}-firewall.service"
+readonly rule_comment="DockerVM:${environment_name}"
+readonly mode="${1:-apply}"
+readonly temporary_chain="${rule_chain}_N"
+
+[[ ${EUID} -eq 0 ]] || {
+    printf 'ERROR: run this script with sudo.\n' >&2
+    exit 1
+}
+[[ ${ssh_port} -ne 3389 && ${rdp_port} -ne 3389 && ${rdp_port} -ge 3390 ]] || {
+    printf 'ERROR: host port 3389 is reserved and must never be modified.\n' >&2
+    exit 1
+}
+
+command -v iptables >/dev/null 2>&1 || {
+    printf 'ERROR: iptables is required. Use --skip-firewall if Docker uses the nftables backend.\n' >&2
+    exit 1
+}
+iptables -w -n -L DOCKER-USER >/dev/null 2>&1 || {
+    printf 'ERROR: Docker DOCKER-USER chain is unavailable. The nftables backend needs a separate policy.\n' >&2
+    exit 1
+}
+
+remove_jump() {
+    local chain="$1"
+    while iptables -w -C DOCKER-USER -m comment --comment "${rule_comment}" -j "${chain}" >/dev/null 2>&1; do
+        iptables -w -D DOCKER-USER -m comment --comment "${rule_comment}" -j "${chain}"
+    done
+}
+
+remove_chain() {
+    local chain="$1"
+    if iptables -w -n -L "${chain}" >/dev/null 2>&1; then
+        iptables -w -F "${chain}"
+        iptables -w -X "${chain}"
+    fi
+}
+
+if [[ "${mode}" == --remove ]]; then
+    remove_jump "${temporary_chain}"
+    remove_chain "${temporary_chain}"
+    remove_jump "${rule_chain}"
+    remove_chain "${rule_chain}"
+    systemctl disable --now "dockervm-${environment_name}-firewall.service" >/dev/null 2>&1 || true
+    rm -f "${unit_file}" "${installed_script}" "${legacy_installed_script}"
+    systemctl daemon-reload
+    printf 'Removed firewall policy for %s.\n' "${environment_name}"
+    exit 0
+fi
+[[ "${mode}" == apply || "${mode}" == --apply-only ]] || {
+    printf 'Usage: %s [--apply-only|--remove]\n' "$0" >&2
+    exit 2
+}
+
+remove_jump "${temporary_chain}"
+remove_chain "${temporary_chain}"
+iptables -w -N "${temporary_chain}"
+
+for port in "${ssh_port}" "${rdp_port}"; do
+    iptables -w -A "${temporary_chain}" \
+        -p tcp -s "${remote_subnet}" \
+        -m conntrack --ctdir ORIGINAL --ctorigdst "${local_address}" --ctorigdstport "${port}" \
+        -j RETURN
+    iptables -w -A "${temporary_chain}" \
+        -p tcp \
+        -m conntrack --ctdir ORIGINAL --ctorigdst "${local_address}" --ctorigdstport "${port}" \
+        -j DROP
+done
+iptables -w -A "${temporary_chain}" -j RETURN
+
+# Install the new policy before removing the previous one. A failure therefore
+# leaves at least one access policy in place instead of exposing the ports.
+iptables -w -I DOCKER-USER 1 -m comment --comment "${rule_comment}" -j "${temporary_chain}"
+remove_jump "${rule_chain}"
+remove_chain "${rule_chain}"
+iptables -w -E "${temporary_chain}" "${rule_chain}"
+
+if [[ "${mode}" != --apply-only ]]; then
+    install -d -m 0755 /usr/local/lib/dockervm
+    install -m 0755 "$0" "${installed_script}"
+    cat > "${unit_file}" <<EOF
+[Unit]
+Description=DockerVM ${environment_name} container firewall
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${installed_script} --apply-only
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 0644 "${unit_file}"
+    systemctl daemon-reload
+    systemctl enable "dockervm-${environment_name}-firewall.service" >/dev/null
+    rm -f "${legacy_installed_script}"
+fi
+
+printf 'Allowed %s to %s:%s and %s:%s; all other sources are dropped for those published ports.\n' \
+    "${remote_subnet}" "${local_address}" "${ssh_port}" "${local_address}" "${rdp_port}"

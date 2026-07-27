@@ -9,6 +9,8 @@ param(
     [int]$SshPort = 0,
     [int]$RdpPort = 0,
     [string]$RemoteSubnet,
+    [ValidateSet('Cloudflare', 'WireGuard')]
+    [string]$RemoteAccessProvider,
     [string]$WireGuardHubEndpoint,
     [string]$WireGuardHubPublicKey,
     [string]$WireGuardAddress,
@@ -446,6 +448,610 @@ function Read-EnvironmentFile {
         }
     }
     return $values
+}
+
+function Read-EnvironmentManifest {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $null
+    }
+    try {
+        return [IO.File]::ReadAllText($Path) | ConvertFrom-Json
+    }
+    catch {
+        throw "Environment manifest is not valid JSON: $Path"
+    }
+}
+
+function Get-ObjectPropertyValue {
+    param(
+        [AllowNull()] [object]$Object,
+        [Parameter(Mandatory)] [string]$Name,
+        [AllowNull()] [object]$Default = $null
+    )
+
+    if ($null -eq $Object) {
+        return $Default
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $Default
+    }
+    return $property.Value
+}
+
+function ConvertTo-IPv4Address {
+    param([Parameter(Mandatory)] [uint64]$Value)
+
+    if ($Value -gt [uint64]::MaxValue -or $Value -gt 4294967295) {
+        throw "IPv4 integer is outside the supported range: $Value"
+    }
+    return '{0}.{1}.{2}.{3}' -f `
+        (($Value -shr 24) -band 255),
+        (($Value -shr 16) -band 255),
+        (($Value -shr 8) -band 255),
+        ($Value -band 255)
+}
+
+function Test-IPv4CidrContains {
+    param(
+        [Parameter(Mandatory)] [string]$Container,
+        [Parameter(Mandatory)] [string]$Candidate
+    )
+
+    $containerCidr = Get-IPv4CidrInfo -Value $Container
+    $candidateCidr = Get-IPv4CidrInfo -Value $Candidate
+    if ($null -eq $containerCidr -or $null -eq $candidateCidr) {
+        return $false
+    }
+    return $containerCidr.NetworkValue -le $candidateCidr.NetworkValue -and
+        $containerCidr.BroadcastValue -ge $candidateCidr.BroadcastValue
+}
+
+function Test-PrivateIPv4Cidr {
+    param([Parameter(Mandatory)] [string]$Value)
+
+    $cidr = Get-IPv4CidrInfo -Value $Value
+    if ($null -eq $cidr -or $cidr.NetworkCidr -ne $Value) {
+        return $false
+    }
+    foreach ($privateRange in @('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')) {
+        if (Test-IPv4CidrContains -Container $privateRange -Candidate $Value) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-CloudflareAddressOwners {
+    param(
+        [Parameter(Mandatory)] [string]$RootPath,
+        [Parameter(Mandatory)] [string]$ExcludedEnvironmentName
+    )
+
+    $owners = @()
+    foreach ($directory in @(Get-ChildItem -LiteralPath $RootPath -Directory -Force -ErrorAction SilentlyContinue)) {
+        if ($directory.Name -eq $ExcludedEnvironmentName -or $directory.Name.StartsWith('.')) {
+            continue
+        }
+
+        $manifest = Read-EnvironmentManifest -Path (Join-Path $directory.FullName '.environment.json')
+        $environmentValues = Read-EnvironmentFile -Path (Join-Path $directory.FullName '.env')
+        $provider = [string](Get-ObjectPropertyValue -Object $manifest -Name 'remoteAccessProvider' -Default '')
+        if ([string]::IsNullOrWhiteSpace($provider) -and $environmentValues.ContainsKey('REMOTE_ACCESS_PROVIDER')) {
+            $provider = $environmentValues['REMOTE_ACCESS_PROVIDER']
+        }
+        if ($provider -ine 'cloudflare') {
+            continue
+        }
+
+        $subnet = [string](Get-ObjectPropertyValue -Object $manifest -Name 'cloudflareDockerSubnet' -Default '')
+        $privateIp = [string](Get-ObjectPropertyValue -Object $manifest -Name 'cloudflarePrivateIp' -Default '')
+        if ([string]::IsNullOrWhiteSpace($subnet) -and $environmentValues.ContainsKey('CLOUDFLARE_PRIVATE_SUBNET')) {
+            $subnet = $environmentValues['CLOUDFLARE_PRIVATE_SUBNET']
+        }
+        if ([string]::IsNullOrWhiteSpace($privateIp) -and $environmentValues.ContainsKey('CLOUDFLARE_PRIVATE_IP')) {
+            $privateIp = $environmentValues['CLOUDFLARE_PRIVATE_IP']
+        }
+        $subnetInfo = Get-IPv4CidrInfo -Value $subnet
+        if ($null -ne $subnetInfo -and $subnetInfo.PrefixLength -eq 29) {
+            $owners += [pscustomobject]@{
+                EnvironmentName = $directory.Name
+                Subnet = $subnetInfo.NetworkCidr
+                PrivateIp = $privateIp
+            }
+        }
+    }
+    return @($owners)
+}
+
+function Get-DockerNetworkCidrs {
+    param([string[]]$ExcludedNames = @())
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $networkIds = @(& docker network ls -q 2>$null)
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Docker networks could not be listed.'
+        }
+        $cidrs = @()
+        foreach ($networkId in $networkIds) {
+            if ([string]::IsNullOrWhiteSpace([string]$networkId)) {
+                continue
+            }
+            $networkJson = [string](& docker network inspect --format '{{json .}}' ([string]$networkId).Trim() 2>$null)
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($networkJson)) {
+                continue
+            }
+            try {
+                $network = $networkJson | ConvertFrom-Json
+            }
+            catch {
+                continue
+            }
+            if ($ExcludedNames -contains [string]$network.Name) {
+                continue
+            }
+            foreach ($configuration in @($network.IPAM.Config)) {
+                if ($null -eq $configuration) {
+                    continue
+                }
+                $subnet = [string](Get-ObjectPropertyValue -Object $configuration -Name 'Subnet' -Default '')
+                if ($null -ne (Get-IPv4CidrInfo -Value $subnet)) {
+                    $cidrs += $subnet
+                }
+            }
+        }
+        return @($cidrs | Sort-Object -Unique)
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
+function Get-HostRouteCidrs {
+    $cidrs = @()
+    try {
+        foreach ($route in @(Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop)) {
+            $destination = [string]$route.DestinationPrefix
+            $cidr = Get-IPv4CidrInfo -Value $destination
+            if ($null -ne $cidr -and $cidr.PrefixLength -gt 0) {
+                $cidrs += $cidr.NetworkCidr
+            }
+        }
+    }
+    catch {
+        Write-Verbose "Host IPv4 route inspection failed: $($_.Exception.Message)"
+    }
+    return @($cidrs | Sort-Object -Unique)
+}
+
+function Get-CloudflarePrivateAllocation {
+    param(
+        [Parameter(Mandatory)] [string]$PoolCidr,
+        [string[]]$ReservedCidrs = @(),
+        [string]$PreferredSubnet,
+        [string]$PreferredPrivateIp
+    )
+
+    $pool = Get-IPv4CidrInfo -Value $PoolCidr
+    if ($null -eq $pool -or $pool.PrefixLength -gt 29) {
+        throw "Cloudflare private pool must contain at least one /29: $PoolCidr"
+    }
+
+    $candidateSubnets = $null
+    if (-not [string]::IsNullOrWhiteSpace($PreferredSubnet)) {
+        $preferred = Get-IPv4CidrInfo -Value $PreferredSubnet
+        if ($null -eq $preferred -or $preferred.PrefixLength -ne 29 -or
+            $preferred.NetworkCidr -ne $PreferredSubnet -or
+            -not (Test-IPv4CidrContains -Container $PoolCidr -Candidate $PreferredSubnet)) {
+            throw "Existing Cloudflare Docker subnet is not a /29 inside $PoolCidr`: $PreferredSubnet"
+        }
+        $candidateSubnets = @($PreferredSubnet)
+    }
+    $networkValue = $pool.NetworkValue
+    while ($true) {
+        $candidateSubnet = if ($null -ne $candidateSubnets) {
+            $candidateSubnets[0]
+        }
+        else {
+            "$(ConvertTo-IPv4Address -Value $networkValue)/29"
+        }
+        $overlaps = $false
+        foreach ($reservedCidr in @($ReservedCidrs | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+            if ($null -ne (Get-IPv4CidrInfo -Value $reservedCidr) -and
+                (Test-IPv4CidrsOverlap -First $candidateSubnet -Second $reservedCidr)) {
+                $overlaps = $true
+                break
+            }
+        }
+        if ($overlaps) {
+            if ($null -ne $candidateSubnets) { break }
+            $networkValue += [uint64]8
+            if ($networkValue -gt $pool.BroadcastValue) { break }
+            continue
+        }
+
+        $candidateInfo = Get-IPv4CidrInfo -Value $candidateSubnet
+        $expectedPrivateIp = ConvertTo-IPv4Address -Value ($candidateInfo.NetworkValue + 2)
+        $privateIp = if ([string]::IsNullOrWhiteSpace($PreferredPrivateIp)) { $expectedPrivateIp } else { $PreferredPrivateIp }
+        $privateHost = Get-IPv4CidrInfo -Value "$privateIp/32"
+        if ($null -eq $privateHost -or
+            $privateIp -ne $expectedPrivateIp) {
+            throw "Cloudflare private IP must be host +2 in $candidateSubnet`: $privateIp"
+        }
+        return [pscustomobject]@{
+            DockerSubnet = $candidateSubnet
+            PrivateIp = $privateIp
+            PrivateCidr = "$privateIp/32"
+        }
+    }
+
+    throw "No non-overlapping /29 remains in the Cloudflare private pool: $PoolCidr"
+}
+
+function Invoke-CloudflareApi {
+    param(
+        [Parameter(Mandatory)] [ValidateSet('GET', 'POST', 'DELETE')] [string]$Method,
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [string]$ApiToken,
+        [AllowNull()] [object]$Body = $null
+    )
+
+    $request = @{
+        Uri = "https://api.cloudflare.com/client/v4$Path"
+        Method = $Method
+        Headers = @{ Authorization = "Bearer $ApiToken" }
+        ErrorAction = 'Stop'
+        UseBasicParsing = $true
+    }
+    if ($null -ne $Body) {
+        $request['ContentType'] = 'application/json'
+        $request['Body'] = $Body | ConvertTo-Json -Depth 8 -Compress
+    }
+    try {
+        $response = Invoke-RestMethod @request
+    }
+    catch {
+        $statusCode = 'unavailable'
+        try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+        throw "Cloudflare API request failed ($Method $Path, HTTP $statusCode). Check the scoped API token and account configuration."
+    }
+
+    $success = Get-ObjectPropertyValue -Object $response -Name 'success' -Default $true
+    if (-not [bool]$success) {
+        $errorCodes = @()
+        foreach ($apiError in @(Get-ObjectPropertyValue -Object $response -Name 'errors' -Default @())) {
+            $errorCode = Get-ObjectPropertyValue -Object $apiError -Name 'code' -Default $null
+            if ($null -ne $errorCode) { $errorCodes += [string]$errorCode }
+        }
+        $codeSummary = if ($errorCodes.Count -gt 0) { $errorCodes -join ',' } else { 'unknown' }
+        throw "Cloudflare API rejected $Method $Path (error codes: $codeSummary)."
+    }
+    return $response
+}
+
+function Get-CloudflarePagedResults {
+    param(
+        [Parameter(Mandatory)] [string]$ResourcePath,
+        [Parameter(Mandatory)] [string]$ApiToken
+    )
+
+    $results = @()
+    $page = 1
+    do {
+        $separator = if ($ResourcePath.Contains('?')) { '&' } else { '?' }
+        $response = Invoke-CloudflareApi -Method GET `
+            -Path "$ResourcePath${separator}page=$page&per_page=1000" `
+            -ApiToken $ApiToken
+        $results += @(Get-ObjectPropertyValue -Object $response -Name 'result' -Default @())
+        $resultInfo = Get-ObjectPropertyValue -Object $response -Name 'result_info' -Default $null
+        $totalPages = [int](Get-ObjectPropertyValue -Object $resultInfo -Name 'total_pages' -Default 1)
+        $page++
+    } while ($page -le $totalPages)
+    return @($results)
+}
+
+function Test-CloudflareResourceId {
+    param([string]$Value)
+
+    $parsed = [Guid]::Empty
+    return -not [string]::IsNullOrWhiteSpace($Value) -and
+        [Guid]::TryParseExact($Value, 'D', [ref]$parsed)
+}
+
+function Write-CloudflareTransactionJournal {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [string]$EnvironmentName,
+        [Parameter(Mandatory)] [string]$AccountId,
+        [Parameter(Mandatory)] [string]$TunnelName,
+        [Parameter(Mandatory)] [string]$Network,
+        [string]$TunnelId,
+        [string]$RouteId
+    )
+
+    $journal = [ordered]@{
+        schemaVersion = 1
+        environmentName = $EnvironmentName
+        accountId = $AccountId
+        tunnelName = $TunnelName
+        network = $Network
+        tunnelId = $TunnelId
+        routeId = $RouteId
+        updatedAt = [DateTime]::UtcNow.ToString('o')
+    }
+    [IO.File]::WriteAllText(
+        $Path,
+        ($journal | ConvertTo-Json -Depth 3),
+        [Text.UTF8Encoding]::new($false)
+    )
+    Set-SecretAcl -Path $Path
+}
+
+function New-CloudflareTunnelResource {
+    param(
+        [Parameter(Mandatory)] [string]$AccountId,
+        [Parameter(Mandatory)] [string]$ApiToken,
+        [Parameter(Mandatory)] [string]$Name
+    )
+
+    try {
+        $response = Invoke-CloudflareApi -Method POST `
+            -Path "/accounts/$AccountId/cfd_tunnel" `
+            -ApiToken $ApiToken `
+            -Body ([ordered]@{ name = $Name; config_src = 'cloudflare' })
+        $result = Get-ObjectPropertyValue -Object $response -Name 'result' -Default $null
+        $tunnelId = [string](Get-ObjectPropertyValue -Object $result -Name 'id' -Default '')
+        if (-not (Test-CloudflareResourceId -Value $tunnelId)) {
+            throw 'Cloudflare tunnel creation returned an invalid resource ID.'
+        }
+        return $tunnelId
+    }
+    catch {
+        $creationFailure = $_
+        # A timeout can happen after Cloudflare committed the request. Reconcile
+        # the exact preflight-unique name once; never retry the POST blindly.
+        try {
+            $encodedName = [Uri]::EscapeDataString($Name)
+            $matches = @(Get-CloudflarePagedResults `
+                -ResourcePath "/accounts/$AccountId/cfd_tunnel?is_deleted=false&name=$encodedName" `
+                -ApiToken $ApiToken | Where-Object {
+                    [string](Get-ObjectPropertyValue -Object $_ -Name 'name' -Default '') -ceq $Name
+                })
+            if ($matches.Count -eq 1) {
+                $reconciledId = [string](Get-ObjectPropertyValue -Object $matches[0] -Name 'id' -Default '')
+                if (Test-CloudflareResourceId -Value $reconciledId) {
+                    return $reconciledId
+                }
+            }
+        }
+        catch {
+            # Preserve the original, token-safe creation failure below.
+        }
+        $ambiguousFailure = [InvalidOperationException]::new(
+            "Cloudflare tunnel creation outcome is unknown after reconciliation. Do not retry the POST manually; the protected transaction journal will be checked on the next run.",
+            $creationFailure.Exception
+        )
+        $ambiguousFailure.Data['CloudflareMutationOutcomeUnknown'] = 'tunnel'
+        throw $ambiguousFailure
+    }
+}
+
+function New-CloudflareRouteResource {
+    param(
+        [Parameter(Mandatory)] [string]$AccountId,
+        [Parameter(Mandatory)] [string]$ApiToken,
+        [Parameter(Mandatory)] [string]$TunnelId,
+        [Parameter(Mandatory)] [string]$Network,
+        [Parameter(Mandatory)] [string]$Comment
+    )
+
+    try {
+        $response = Invoke-CloudflareApi -Method POST `
+            -Path "/accounts/$AccountId/teamnet/routes" `
+            -ApiToken $ApiToken `
+            -Body ([ordered]@{ network = $Network; tunnel_id = $TunnelId; comment = $Comment })
+        $result = Get-ObjectPropertyValue -Object $response -Name 'result' -Default $null
+        $routeId = [string](Get-ObjectPropertyValue -Object $result -Name 'id' -Default '')
+        if (-not (Test-CloudflareResourceId -Value $routeId)) {
+            throw 'Cloudflare route creation returned an invalid resource ID.'
+        }
+        return $routeId
+    }
+    catch {
+        $creationFailure = $_
+        # Reconcile only the exact network+tunnel tuple. Never resend a POST
+        # whose server-side outcome is unknown.
+        try {
+            $matches = @(Get-CloudflarePagedResults `
+                -ResourcePath "/accounts/$AccountId/teamnet/routes" `
+                -ApiToken $ApiToken | Where-Object {
+                    [string](Get-ObjectPropertyValue -Object $_ -Name 'network' -Default '') -eq $Network -and
+                    [string](Get-ObjectPropertyValue -Object $_ -Name 'tunnel_id' -Default '') -eq $TunnelId
+                })
+            if ($matches.Count -eq 1) {
+                $reconciledId = [string](Get-ObjectPropertyValue -Object $matches[0] -Name 'id' -Default '')
+                if (Test-CloudflareResourceId -Value $reconciledId) {
+                    return $reconciledId
+                }
+            }
+        }
+        catch {
+            # Preserve the original, token-safe creation failure below.
+        }
+        $ambiguousFailure = [InvalidOperationException]::new(
+            "Cloudflare route creation outcome is unknown after reconciliation. Do not retry the POST manually; the protected transaction journal will be checked on the next run.",
+            $creationFailure.Exception
+        )
+        $ambiguousFailure.Data['CloudflareMutationOutcomeUnknown'] = 'route'
+        throw $ambiguousFailure
+    }
+}
+
+function Remove-CloudflareProvisioningResources {
+    param(
+        [Parameter(Mandatory)] [string]$AccountId,
+        [Parameter(Mandatory)] [string]$ApiToken,
+        [string]$RouteId,
+        [string]$TunnelId
+    )
+
+    $routeRemoved = $true
+    $tunnelRemoved = [string]::IsNullOrWhiteSpace($TunnelId)
+    if (-not [string]::IsNullOrWhiteSpace($RouteId)) {
+        try {
+            $null = Invoke-CloudflareApi -Method DELETE `
+                -Path "/accounts/$AccountId/teamnet/routes/$RouteId" `
+                -ApiToken $ApiToken
+        }
+        catch {
+            $routeRemoved = $false
+            Write-Warning "Cloudflare route rollback failed for route ID $RouteId. The new tunnel is being retained to avoid an orphaned route."
+        }
+    }
+    if ($routeRemoved -and -not [string]::IsNullOrWhiteSpace($TunnelId)) {
+        try {
+            $null = Invoke-CloudflareApi -Method DELETE `
+                -Path "/accounts/$AccountId/cfd_tunnel/$TunnelId" `
+                -ApiToken $ApiToken
+            $tunnelRemoved = $true
+        }
+        catch {
+            Write-Warning "Cloudflare tunnel rollback failed for tunnel ID $TunnelId. Remove that tunnel manually after confirming it is unused."
+        }
+    }
+    return $routeRemoved -and $tunnelRemoved
+}
+
+function Invoke-CloudflareTransactionRecovery {
+    param(
+        [Parameter(Mandatory)] [string]$StagingRoot,
+        [Parameter(Mandatory)] [string]$AccountId,
+        [Parameter(Mandatory)] [string]$ApiToken
+    )
+
+    if (-not (Test-Path -LiteralPath $StagingRoot -PathType Container)) {
+        return
+    }
+    $stagingRootFull = [IO.Path]::GetFullPath($StagingRoot).TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
+    foreach ($directory in @(Get-ChildItem -LiteralPath $StagingRoot -Directory -Force -ErrorAction Stop)) {
+        $directoryFull = [IO.Path]::GetFullPath($directory.FullName).TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
+        if (-not $directoryFull.StartsWith($stagingRootFull, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Cloudflare transaction journal path escaped the staging root: $($directory.FullName)"
+        }
+        if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Refusing Cloudflare recovery through a reparse point: $($directory.FullName)"
+        }
+        $journalPath = Join-Path $directory.FullName '.cloudflare-provisioning-transaction.json'
+        if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf)) {
+            continue
+        }
+
+        $journal = Read-EnvironmentManifest -Path $journalPath
+        $journalSchema = [int](Get-ObjectPropertyValue -Object $journal -Name 'schemaVersion' -Default 0)
+        $journalEnvironment = [string](Get-ObjectPropertyValue -Object $journal -Name 'environmentName' -Default '')
+        $journalAccount = [string](Get-ObjectPropertyValue -Object $journal -Name 'accountId' -Default '')
+        $journalTunnelName = [string](Get-ObjectPropertyValue -Object $journal -Name 'tunnelName' -Default '')
+        $journalNetwork = [string](Get-ObjectPropertyValue -Object $journal -Name 'network' -Default '')
+        $journalTunnelId = [string](Get-ObjectPropertyValue -Object $journal -Name 'tunnelId' -Default '')
+        $journalRouteId = [string](Get-ObjectPropertyValue -Object $journal -Name 'routeId' -Default '')
+        if ($journalSchema -ne 1 -or
+            $journalEnvironment -notmatch '^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$' -or
+            $journalTunnelName -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$' -or
+            $null -eq (Get-IPv4CidrInfo -Value $journalNetwork) -or
+            (-not [string]::IsNullOrWhiteSpace($journalTunnelId) -and
+             -not (Test-CloudflareResourceId -Value $journalTunnelId)) -or
+            (-not [string]::IsNullOrWhiteSpace($journalRouteId) -and
+             -not (Test-CloudflareResourceId -Value $journalRouteId))) {
+            throw "Invalid Cloudflare transaction journal; inspect it without deleting Cloudflare resources: $journalPath"
+        }
+        if ($journalAccount -ne $AccountId) {
+            throw "Cloudflare transaction journal belongs to account $journalAccount, not the configured account. Recover it with the matching account configuration: $journalPath"
+        }
+
+        $knownTunnels = @(Get-CloudflarePagedResults `
+            -ResourcePath "/accounts/$AccountId/cfd_tunnel?is_deleted=false" `
+            -ApiToken $ApiToken)
+        $knownRoutes = @(Get-CloudflarePagedResults `
+            -ResourcePath "/accounts/$AccountId/teamnet/routes" `
+            -ApiToken $ApiToken)
+        $ownedTunnel = if ([string]::IsNullOrWhiteSpace($journalTunnelId)) {
+            @($knownTunnels | Where-Object {
+                [string](Get-ObjectPropertyValue -Object $_ -Name 'name' -Default '') -ceq $journalTunnelName
+            })
+        }
+        else {
+            @($knownTunnels | Where-Object {
+                [string](Get-ObjectPropertyValue -Object $_ -Name 'id' -Default '') -eq $journalTunnelId
+            })
+        }
+        if ($ownedTunnel.Count -eq 1 -and [string]::IsNullOrWhiteSpace($journalTunnelId)) {
+            $journalTunnelId = [string](Get-ObjectPropertyValue -Object $ownedTunnel[0] -Name 'id' -Default '')
+            if (-not (Test-CloudflareResourceId -Value $journalTunnelId)) {
+                throw "Cloudflare transaction recovery found an invalid tunnel ID: $journalPath"
+            }
+        }
+        $ownedRoute = if ([string]::IsNullOrWhiteSpace($journalRouteId)) {
+            if ([string]::IsNullOrWhiteSpace($journalTunnelId)) {
+                @()
+            }
+            else {
+                @($knownRoutes | Where-Object {
+                    [string](Get-ObjectPropertyValue -Object $_ -Name 'network' -Default '') -eq $journalNetwork -and
+                    [string](Get-ObjectPropertyValue -Object $_ -Name 'tunnel_id' -Default '') -eq $journalTunnelId
+                })
+            }
+        }
+        else {
+            @($knownRoutes | Where-Object {
+                [string](Get-ObjectPropertyValue -Object $_ -Name 'id' -Default '') -eq $journalRouteId
+            })
+        }
+        if ($ownedTunnel.Count -gt 1 -or $ownedRoute.Count -gt 1) {
+            throw "Cloudflare transaction recovery found ambiguous matching resources: $journalPath"
+        }
+        if ($ownedTunnel.Count -eq 1 -and
+            [string](Get-ObjectPropertyValue -Object $ownedTunnel[0] -Name 'name' -Default '') -cne $journalTunnelName) {
+            throw "Cloudflare transaction tunnel ownership check failed: $journalPath"
+        }
+        if ($ownedRoute.Count -eq 1 -and
+            [string](Get-ObjectPropertyValue -Object $ownedRoute[0] -Name 'tunnel_id' -Default '') -ne $journalTunnelId) {
+            throw "Cloudflare transaction route ownership check failed: $journalPath"
+        }
+        if ($ownedRoute.Count -eq 1 -and
+            [string](Get-ObjectPropertyValue -Object $ownedRoute[0] -Name 'network' -Default '') -ne $journalNetwork) {
+            throw "Cloudflare transaction route network check failed: $journalPath"
+        }
+        if ($ownedRoute.Count -eq 1 -and
+            -not (Test-CloudflareResourceId -Value ([string](Get-ObjectPropertyValue -Object $ownedRoute[0] -Name 'id' -Default '')))) {
+            throw "Cloudflare transaction recovery found an invalid route ID: $journalPath"
+        }
+        if ($ownedRoute.Count -eq 1 -and $ownedTunnel.Count -ne 1) {
+            throw "Cloudflare transaction route exists without its recorded tunnel: $journalPath"
+        }
+
+        $routeToRemove = if ($ownedRoute.Count -eq 1) {
+            [string](Get-ObjectPropertyValue -Object $ownedRoute[0] -Name 'id' -Default '')
+        }
+        else { $null }
+        $tunnelToRemove = if ($ownedTunnel.Count -eq 1) { $journalTunnelId } else { $null }
+        $recovered = Remove-CloudflareProvisioningResources `
+            -AccountId $AccountId `
+            -ApiToken $ApiToken `
+            -RouteId $routeToRemove `
+            -TunnelId $tunnelToRemove
+        if (-not $recovered) {
+            throw "Cloudflare transaction recovery did not finish. Keep this journal and retry after restoring API access: $journalPath"
+        }
+        Remove-Item -LiteralPath $journalPath -Force
+        Write-Warning "Recovered an interrupted Cloudflare provisioning transaction for environment '$journalEnvironment'."
+        # The directory was resolved inside .staging and verified not to be a
+        # reparse point above; it contains only an interrupted generator output.
+        Remove-Item -LiteralPath $directory.FullName -Recurse -Force
+    }
 }
 
 function Get-WireGuardAddressOwners {
@@ -1024,13 +1630,16 @@ function Assert-DockerEngineVersion {
 }
 
 function Write-EnvironmentServiceLogs {
-    param([Parameter(Mandatory)] [string]$ProjectPath)
+    param(
+        [Parameter(Mandatory)] [string]$ProjectPath,
+        [Parameter(Mandatory)] [string[]]$ServiceNames
+    )
 
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     Push-Location $ProjectPath
     try {
-        & docker compose --env-file .env logs --no-color --tail 100 desktop docker wireguard remote_proxy
+        & docker compose --env-file .env logs --no-color --tail 100 @ServiceNames
     }
     finally {
         Pop-Location
@@ -1041,10 +1650,10 @@ function Write-EnvironmentServiceLogs {
 function Wait-EnvironmentHealthy {
     param(
         [Parameter(Mandatory)] [string]$ProjectPath,
+        [Parameter(Mandatory)] [string[]]$ServiceNames,
         [int]$TimeoutSeconds = 600
     )
 
-    $serviceNames = @('desktop', 'docker', 'wireguard', 'remote_proxy')
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
         Push-Location $ProjectPath
@@ -1067,8 +1676,8 @@ function Wait-EnvironmentHealthy {
                     return
                 }
                 if (@($serviceStates.Values | Where-Object { $_ -eq 'unhealthy' }).Count -gt 0) {
-                    $stateSummary = ($serviceNames | ForEach-Object { "$_=$($serviceStates[$_])" }) -join ', '
-                    Write-EnvironmentServiceLogs -ProjectPath $ProjectPath
+                    $stateSummary = ($ServiceNames | ForEach-Object { "$_=$($serviceStates[$_])" }) -join ', '
+                    Write-EnvironmentServiceLogs -ProjectPath $ProjectPath -ServiceNames $ServiceNames
                     throw "컨테이너가 unhealthy 상태입니다: $stateSummary"
                 }
             }
@@ -1078,7 +1687,7 @@ function Wait-EnvironmentHealthy {
         }
         Start-Sleep -Seconds 3
     }
-    Write-EnvironmentServiceLogs -ProjectPath $ProjectPath
+    Write-EnvironmentServiceLogs -ProjectPath $ProjectPath -ServiceNames $ServiceNames
     throw "환경이 제한 시간 안에 healthy가 되지 않았습니다: $ProjectPath"
 }
 
@@ -1130,6 +1739,54 @@ $gpuTestScriptName = 'TestGpu.ps1'
 $targetPath = Join-Path $rootFullPath $EnvironmentName
 $targetExists = Test-Path -LiteralPath $targetPath
 $oldEnvironment = Read-EnvironmentFile (Join-Path $targetPath '.env')
+$oldManifest = Read-EnvironmentManifest -Path (Join-Path $targetPath '.environment.json')
+$oldSchemaVersion = [int](Get-ObjectPropertyValue -Object $oldManifest -Name 'schemaVersion' -Default 0)
+$oldRemoteAccessProvider = [string](Get-ObjectPropertyValue `
+    -Object $oldManifest `
+    -Name 'remoteAccessProvider' `
+    -Default '')
+if ([string]::IsNullOrWhiteSpace($oldRemoteAccessProvider) -and
+    $oldEnvironment.ContainsKey('REMOTE_ACCESS_PROVIDER')) {
+    $oldRemoteAccessProvider = $oldEnvironment['REMOTE_ACCESS_PROVIDER']
+}
+if ($targetExists) {
+    if ([string]::IsNullOrWhiteSpace($oldRemoteAccessProvider)) {
+        # Schema 1-3 environments predate provider selection and are WireGuard environments.
+        $oldRemoteAccessProvider = 'wireguard'
+    }
+    $oldRemoteAccessProvider = $oldRemoteAccessProvider.Trim().ToLowerInvariant()
+    if ($oldRemoteAccessProvider -notin @('cloudflare', 'wireguard')) {
+        throw "Existing environment has an unsupported remote-access provider: $oldRemoteAccessProvider"
+    }
+    if ($PSBoundParameters.ContainsKey('RemoteAccessProvider') -and
+        $RemoteAccessProvider.Trim().ToLowerInvariant() -ne $oldRemoteAccessProvider) {
+        throw "Automatic remote-access migration is disabled. Existing schema $oldSchemaVersion environment must remain $oldRemoteAccessProvider."
+    }
+    $RemoteAccessProvider = $oldRemoteAccessProvider
+}
+elseif ([string]::IsNullOrWhiteSpace($RemoteAccessProvider)) {
+    $RemoteAccessProvider = 'cloudflare'
+}
+else {
+    $RemoteAccessProvider = $RemoteAccessProvider.Trim().ToLowerInvariant()
+}
+
+$WireGuardIp = $null
+$WireGuardNetwork = $null
+$cloudflareApiToken = $null
+$cloudflareAccountId = $null
+$cloudflareTeamName = $null
+$cloudflarePrivatePool = $null
+$cloudflarePrivateIp = $null
+$cloudflarePrivateCidr = $null
+$cloudflareDockerSubnet = $null
+$cloudflareTunnelName = $null
+$cloudflareTunnelId = $null
+$cloudflareRouteId = $null
+$cloudflareProvisioningStatus = $null
+$cloudflareTunnelTokenFile = 'secrets/cloudflared_tunnel_token'
+$cloudflareKnownRoutes = @()
+$cloudflareKnownTunnels = @()
 
 if ([string]::IsNullOrWhiteSpace($AccountName)) {
     $defaultAccountName = if ($oldEnvironment.ContainsKey('ACCOUNT_NAME')) {
@@ -1273,6 +1930,8 @@ if (-not (Test-Cidr $RemoteSubnet)) {
     throw "유효하지 않거나 지나치게 넓은 CIDR입니다: $RemoteSubnet"
 }
 
+$wireGuardAddressOwners = @()
+if ($RemoteAccessProvider -eq 'wireguard') {
 if ([string]::IsNullOrWhiteSpace($WireGuardHubEndpoint)) {
     if ($oldEnvironment.ContainsKey('WIREGUARD_HUB_ENDPOINT') -and
         -not [string]::IsNullOrWhiteSpace($oldEnvironment['WIREGUARD_HUB_ENDPOINT'])) {
@@ -1368,6 +2027,162 @@ if (-not $PSBoundParameters.ContainsKey('WireGuardKeepalive')) {
 }
 if ($WireGuardKeepalive -lt 0 -or $WireGuardKeepalive -gt 65535) {
     throw 'WireGuard keepalive는 0 이상 65535 이하여야 합니다.'
+}
+}
+else {
+    if ($GenerateOnly) {
+        throw 'GenerateOnly cannot provision a runnable Cloudflare tunnel. Use a normal run, or explicitly select WireGuard for generate-only output.'
+    }
+    $rootConfigurationPath = Join-Path $PSScriptRoot '.env'
+    if (-not (Test-Path -LiteralPath $rootConfigurationPath -PathType Leaf)) {
+        throw "Cloudflare provisioning configuration is missing: $rootConfigurationPath"
+    }
+    $rootConfigurationItem = Get-Item -LiteralPath $rootConfigurationPath -Force
+    if (($rootConfigurationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Cloudflare provisioning configuration must not be a reparse point: $rootConfigurationPath"
+    }
+    Set-SecretAcl -Path $rootConfigurationPath
+    $rootEnvironment = Read-EnvironmentFile -Path $rootConfigurationPath
+    foreach ($requiredKey in @(
+            'CLOUDFLARE_API_TOKEN',
+            'CLOUDFLARE_ACCOUNT_ID',
+            'CLOUDFLARE_TEAM_NAME',
+            'CLOUDFLARE_PRIVATE_CIDR'
+        )) {
+        if (-not $rootEnvironment.ContainsKey($requiredKey) -or
+            [string]::IsNullOrWhiteSpace($rootEnvironment[$requiredKey])) {
+            throw "Root .env is missing required Cloudflare setting: $requiredKey"
+        }
+    }
+
+    $cloudflareApiToken = $rootEnvironment['CLOUDFLARE_API_TOKEN'].Trim()
+    $cloudflareAccountId = $rootEnvironment['CLOUDFLARE_ACCOUNT_ID'].Trim().ToLowerInvariant()
+    $cloudflareTeamName = $rootEnvironment['CLOUDFLARE_TEAM_NAME'].Trim().ToLowerInvariant()
+    $cloudflarePrivatePool = $rootEnvironment['CLOUDFLARE_PRIVATE_CIDR'].Trim()
+    if ($cloudflareApiToken.IndexOfAny([char[]]"`r`n`0") -ge 0) {
+        throw 'CLOUDFLARE_API_TOKEN contains an invalid control character.'
+    }
+    if ($cloudflareAccountId -notmatch '^[A-Fa-f0-9]{32}$') {
+        throw 'CLOUDFLARE_ACCOUNT_ID must be a 32-character hexadecimal account ID.'
+    }
+    if ($cloudflareTeamName.Length -gt 63 -or
+        $cloudflareTeamName -notmatch '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$') {
+        throw 'CLOUDFLARE_TEAM_NAME must be the team slug without .cloudflareaccess.com.'
+    }
+    $privatePoolInfo = Get-IPv4CidrInfo -Value $cloudflarePrivatePool
+    if ($null -eq $privatePoolInfo -or
+        $privatePoolInfo.NetworkCidr -ne $cloudflarePrivatePool -or
+        $privatePoolInfo.PrefixLength -gt 29 -or
+        -not (Test-PrivateIPv4Cidr -Value $cloudflarePrivatePool)) {
+        throw 'CLOUDFLARE_PRIVATE_CIDR must be a canonical RFC1918 IPv4 network containing at least one /29.'
+    }
+
+    $cloudflareTunnelName = [string](Get-ObjectPropertyValue `
+        -Object $oldManifest `
+        -Name 'cloudflareTunnelName' `
+        -Default "dockervm-$EnvironmentName")
+    $cloudflareTunnelId = [string](Get-ObjectPropertyValue `
+        -Object $oldManifest `
+        -Name 'cloudflareTunnelId' `
+        -Default '')
+    $cloudflareRouteId = [string](Get-ObjectPropertyValue `
+        -Object $oldManifest `
+        -Name 'cloudflareRouteId' `
+        -Default '')
+    if ($cloudflareTunnelName -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$') {
+        throw "Cloudflare tunnel name is invalid: $cloudflareTunnelName"
+    }
+    if ($targetExists -and
+        ([string]::IsNullOrWhiteSpace($cloudflareTunnelId) -or
+         [string]::IsNullOrWhiteSpace($cloudflareRouteId))) {
+        throw 'Existing Cloudflare environment is missing its tunnel or route ID; automatic resource adoption is disabled.'
+    }
+    if ($targetExists -and
+        (-not (Test-CloudflareResourceId -Value $cloudflareTunnelId) -or
+         -not (Test-CloudflareResourceId -Value $cloudflareRouteId))) {
+        throw 'Existing Cloudflare environment contains an invalid tunnel or route UUID.'
+    }
+
+    # These account-scoped reads validate the Developer Platform API token without
+    # relying on /user/tokens/verify, which rejects account-owned tokens.
+    $cloudflareKnownTunnels = @(Get-CloudflarePagedResults `
+        -ResourcePath "/accounts/$cloudflareAccountId/cfd_tunnel?is_deleted=false" `
+        -ApiToken $cloudflareApiToken)
+    $cloudflareKnownRoutes = @(Get-CloudflarePagedResults `
+        -ResourcePath "/accounts/$cloudflareAccountId/teamnet/routes" `
+        -ApiToken $cloudflareApiToken)
+
+    if ($targetExists) {
+        $ownedTunnel = @($cloudflareKnownTunnels | Where-Object {
+            [string](Get-ObjectPropertyValue -Object $_ -Name 'id' -Default '') -eq $cloudflareTunnelId
+        })
+        if ($ownedTunnel.Count -ne 1 -or
+            [string](Get-ObjectPropertyValue -Object $ownedTunnel[0] -Name 'name' -Default '') -cne $cloudflareTunnelName) {
+            throw "Existing Cloudflare tunnel ownership could not be verified: $cloudflareTunnelId"
+        }
+        $ownedRoute = @($cloudflareKnownRoutes | Where-Object {
+            [string](Get-ObjectPropertyValue -Object $_ -Name 'id' -Default '') -eq $cloudflareRouteId
+        })
+        if ($ownedRoute.Count -ne 1 -or
+            [string](Get-ObjectPropertyValue -Object $ownedRoute[0] -Name 'tunnel_id' -Default '') -ne $cloudflareTunnelId) {
+            throw "Existing Cloudflare route ownership could not be verified: $cloudflareRouteId"
+        }
+    }
+    # New-environment name collisions are rechecked under the global lock after
+    # interrupted-transaction recovery has had a chance to remove stale resources.
+
+    $preferredSubnet = [string](Get-ObjectPropertyValue `
+        -Object $oldManifest `
+        -Name 'cloudflareDockerSubnet' `
+        -Default '')
+    $preferredPrivateIp = [string](Get-ObjectPropertyValue `
+        -Object $oldManifest `
+        -Name 'cloudflarePrivateIp' `
+        -Default '')
+    if ([string]::IsNullOrWhiteSpace($preferredSubnet) -and
+        $oldEnvironment.ContainsKey('CLOUDFLARE_PRIVATE_SUBNET')) {
+        $preferredSubnet = $oldEnvironment['CLOUDFLARE_PRIVATE_SUBNET']
+    }
+    if ([string]::IsNullOrWhiteSpace($preferredPrivateIp) -and
+        $oldEnvironment.ContainsKey('CLOUDFLARE_PRIVATE_IP')) {
+        $preferredPrivateIp = $oldEnvironment['CLOUDFLARE_PRIVATE_IP']
+    }
+
+    $cloudflareAddressOwners = @(Get-CloudflareAddressOwners `
+        -RootPath $rootFullPath `
+        -ExcludedEnvironmentName $EnvironmentName)
+    $reservedCloudflareCidrs = @($cloudflareAddressOwners | ForEach-Object { $_.Subnet })
+    $reservedCloudflareCidrs += @(Get-DockerNetworkCidrs -ExcludedNames @(
+        "${EnvironmentName}_remote_access",
+        "${EnvironmentName}_cloudflare_egress"
+    ))
+    $reservedCloudflareCidrs += @(Get-HostRouteCidrs)
+    $reservedCloudflareCidrs += $RemoteSubnet
+    foreach ($route in $cloudflareKnownRoutes) {
+        $routeId = [string](Get-ObjectPropertyValue -Object $route -Name 'id' -Default '')
+        if ($targetExists -and $routeId -eq $cloudflareRouteId) {
+            continue
+        }
+        $routeNetwork = [string](Get-ObjectPropertyValue -Object $route -Name 'network' -Default '')
+        if ($null -ne (Get-IPv4CidrInfo -Value $routeNetwork)) {
+            $reservedCloudflareCidrs += $routeNetwork
+        }
+    }
+    $cloudflareAllocation = Get-CloudflarePrivateAllocation `
+        -PoolCidr $cloudflarePrivatePool `
+        -ReservedCidrs @($reservedCloudflareCidrs | Sort-Object -Unique) `
+        -PreferredSubnet $preferredSubnet `
+        -PreferredPrivateIp $preferredPrivateIp
+    $cloudflarePrivateIp = $cloudflareAllocation.PrivateIp
+    $cloudflarePrivateCidr = $cloudflareAllocation.PrivateCidr
+    $cloudflareDockerSubnet = $cloudflareAllocation.DockerSubnet
+    if ($targetExists) {
+        $ownedRouteNetwork = [string](Get-ObjectPropertyValue -Object $ownedRoute[0] -Name 'network' -Default '')
+        if ($ownedRouteNetwork -ne $cloudflarePrivateCidr) {
+            throw "Existing Cloudflare route does not match the environment address: $ownedRouteNetwork"
+        }
+    }
+    $cloudflareProvisioningStatus = if ($targetExists) { 'verified' } else { 'pending' }
 }
 
 if ($SshPort -eq 0) {
@@ -1521,13 +2336,19 @@ catch {
 }
 
 $backupPath = $null
+$failedPath = $null
 $oldStopped = $false
 $swapped = $false
 $newStarted = $false
 $migrationPath = $null
 $completed = $false
+$createdCloudflareTunnelId = $null
+$createdCloudflareRouteId = $null
+$cloudflareTransactionJournalPath = $null
+$cloudflareRollbackSucceeded = $true
 
 try {
+    if ($RemoteAccessProvider -eq 'wireguard') {
     $wireGuardOwnersAfterLock = @(Get-WireGuardAddressOwners `
         -RootPath $rootFullPath `
         -ExcludedEnvironmentName $EnvironmentName)
@@ -1535,6 +2356,49 @@ try {
     if ($duplicateAfterLock.Count -gt 0) {
         $duplicateNames = ($duplicateAfterLock | ForEach-Object { $_.EnvironmentName }) -join ', '
         throw "WireGuard IP $WireGuardIp 가 대기 중 다른 환경에 할당되었습니다: $duplicateNames"
+    }
+    }
+    else {
+        Invoke-CloudflareTransactionRecovery `
+            -StagingRoot $stagingRoot `
+            -AccountId $cloudflareAccountId `
+            -ApiToken $cloudflareApiToken
+        if (-not $targetExists) {
+            $tunnelsAfterRecovery = @(Get-CloudflarePagedResults `
+                -ResourcePath "/accounts/$cloudflareAccountId/cfd_tunnel?is_deleted=false" `
+                -ApiToken $cloudflareApiToken)
+            $nameCollisionsAfterRecovery = @($tunnelsAfterRecovery | Where-Object {
+                [string](Get-ObjectPropertyValue -Object $_ -Name 'name' -Default '') -ceq $cloudflareTunnelName
+            })
+            if ($nameCollisionsAfterRecovery.Count -gt 0) {
+                throw "A Cloudflare tunnel named '$cloudflareTunnelName' already exists but is not owned by this environment."
+            }
+        }
+        $cloudflareOwnersAfterLock = @(Get-CloudflareAddressOwners `
+            -RootPath $rootFullPath `
+            -ExcludedEnvironmentName $EnvironmentName)
+        $duplicateCloudflareSubnet = @($cloudflareOwnersAfterLock | Where-Object {
+            $_.Subnet -eq $cloudflareDockerSubnet
+        })
+        if ($duplicateCloudflareSubnet.Count -gt 0) {
+            $duplicateNames = ($duplicateCloudflareSubnet | ForEach-Object { $_.EnvironmentName }) -join ', '
+            throw "Cloudflare subnet $cloudflareDockerSubnet was assigned while this generator waited: $duplicateNames"
+        }
+
+        $routesAfterLock = @(Get-CloudflarePagedResults `
+            -ResourcePath "/accounts/$cloudflareAccountId/teamnet/routes" `
+            -ApiToken $cloudflareApiToken)
+        foreach ($route in $routesAfterLock) {
+            $routeId = [string](Get-ObjectPropertyValue -Object $route -Name 'id' -Default '')
+            if ($targetExists -and $routeId -eq $cloudflareRouteId) {
+                continue
+            }
+            $routeNetwork = [string](Get-ObjectPropertyValue -Object $route -Name 'network' -Default '')
+            if ($null -ne (Get-IPv4CidrInfo -Value $routeNetwork) -and
+                (Test-IPv4CidrsOverlap -First $cloudflareDockerSubnet -Second $routeNetwork)) {
+                throw "Cloudflare route $routeNetwork overlaps the allocated Docker subnet $cloudflareDockerSubnet."
+            }
+        }
     }
 
     New-Item -ItemType Directory -Path $stagingPath -Force | Out-Null
@@ -1596,6 +2460,74 @@ try {
     )
     Set-SecretAcl -Path $sshAuthorizedKeysPath
 
+    if ($RemoteAccessProvider -eq 'cloudflare') {
+        $cloudflaredTunnelTokenPath = Join-Path $secretDirectory 'cloudflared_tunnel_token'
+        if (-not $targetExists) {
+            $cloudflareTransactionJournalPath = Join-Path $stagingPath '.cloudflare-provisioning-transaction.json'
+            Write-CloudflareTransactionJournal `
+                -Path $cloudflareTransactionJournalPath `
+                -EnvironmentName $EnvironmentName `
+                -AccountId $cloudflareAccountId `
+                -TunnelName $cloudflareTunnelName `
+                -Network $cloudflarePrivateCidr
+            $cloudflareTunnelId = New-CloudflareTunnelResource `
+                -AccountId $cloudflareAccountId `
+                -ApiToken $cloudflareApiToken `
+                -Name $cloudflareTunnelName
+            $createdCloudflareTunnelId = $cloudflareTunnelId
+            Write-CloudflareTransactionJournal `
+                -Path $cloudflareTransactionJournalPath `
+                -EnvironmentName $EnvironmentName `
+                -AccountId $cloudflareAccountId `
+                -TunnelName $cloudflareTunnelName `
+                -Network $cloudflarePrivateCidr `
+                -TunnelId $createdCloudflareTunnelId
+        }
+
+            $tokenResponse = Invoke-CloudflareApi -Method GET `
+                -Path "/accounts/$cloudflareAccountId/cfd_tunnel/$cloudflareTunnelId/token" `
+                -ApiToken $cloudflareApiToken
+            $cloudflaredRuntimeToken = [string](Get-ObjectPropertyValue `
+                -Object $tokenResponse `
+                -Name 'result' `
+                -Default '')
+            if ([string]::IsNullOrWhiteSpace($cloudflaredRuntimeToken) -or
+                $cloudflaredRuntimeToken.IndexOfAny([char[]]"`r`n`0") -ge 0) {
+                throw 'Cloudflare returned an invalid tunnel runtime token.'
+            }
+
+        if (-not $targetExists) {
+                $cloudflareRouteId = New-CloudflareRouteResource `
+                    -AccountId $cloudflareAccountId `
+                    -ApiToken $cloudflareApiToken `
+                    -TunnelId $cloudflareTunnelId `
+                    -Network $cloudflarePrivateCidr `
+                    -Comment "DockerVM environment: $EnvironmentName"
+                $createdCloudflareRouteId = $cloudflareRouteId
+                Write-CloudflareTransactionJournal `
+                    -Path $cloudflareTransactionJournalPath `
+                    -EnvironmentName $EnvironmentName `
+                    -AccountId $cloudflareAccountId `
+                    -TunnelName $cloudflareTunnelName `
+                    -Network $cloudflarePrivateCidr `
+                    -TunnelId $createdCloudflareTunnelId `
+                    -RouteId $createdCloudflareRouteId
+        }
+
+        try {
+            [IO.File]::WriteAllText(
+                $cloudflaredTunnelTokenPath,
+                $cloudflaredRuntimeToken,
+                [Text.UTF8Encoding]::new($false)
+            )
+        }
+        finally {
+            $cloudflaredRuntimeToken = $null
+        }
+        $cloudflareProvisioningStatus = 'ready'
+        Set-SecretAcl -Path $cloudflaredTunnelTokenPath
+    }
+
     $desktopCpuText = $DesktopCpus.ToString('0.##', [Globalization.CultureInfo]::InvariantCulture)
     $dindCpuText = $DindCpus.ToString('0.##', [Globalization.CultureInfo]::InvariantCulture)
     $desktopCpuDisplay = if ($desktopCpuUnlimited) { 'unlimited (-1)' } else { $desktopCpuText }
@@ -1619,12 +2551,26 @@ try {
         "SSH_PORT=$SshPort",
         "RDP_PORT=$RdpPort",
         "REMOTE_SUBNET=$RemoteSubnet",
-        "WIREGUARD_ADDRESS=$WireGuardAddress",
-        "WIREGUARD_NETWORK=$WireGuardNetwork",
-        "WIREGUARD_HUB_ENDPOINT=$WireGuardHubEndpoint",
-        "WIREGUARD_HUB_PUBLIC_KEY=$WireGuardHubPublicKey",
-        "WIREGUARD_MTU=$WireGuardMtu",
-        "WIREGUARD_KEEPALIVE=$WireGuardKeepalive",
+        "REMOTE_ACCESS_PROVIDER=$RemoteAccessProvider"
+    )
+    if ($RemoteAccessProvider -eq 'wireguard') {
+        $environmentLines += @(
+            "WIREGUARD_ADDRESS=$WireGuardAddress",
+            "WIREGUARD_NETWORK=$WireGuardNetwork",
+            "WIREGUARD_HUB_ENDPOINT=$WireGuardHubEndpoint",
+            "WIREGUARD_HUB_PUBLIC_KEY=$WireGuardHubPublicKey",
+            "WIREGUARD_MTU=$WireGuardMtu",
+            "WIREGUARD_KEEPALIVE=$WireGuardKeepalive"
+        )
+    }
+    else {
+        $environmentLines += @(
+            "CLOUDFLARE_PRIVATE_IP=$cloudflarePrivateIp",
+            "CLOUDFLARE_PRIVATE_CIDR=$cloudflarePrivateCidr",
+            "CLOUDFLARE_PRIVATE_SUBNET=$cloudflareDockerSubnet"
+        )
+    }
+    $environmentLines += @(
         '# A resource value of -1 means unlimited; the corresponding Compose limit is omitted.',
         "DESKTOP_CPUS=$desktopCpuText",
         "DESKTOP_MEMORY=$DesktopMemory",
@@ -1654,6 +2600,119 @@ try {
     }
     Set-SecretAcl -Path $secretPath
 
+    $remoteServiceTemplateName = if ($RemoteAccessProvider -eq 'cloudflare') {
+        'compose.cloudflare.services.template'
+    }
+    else {
+        'compose.wireguard.services.template'
+    }
+    $remoteServiceTemplatePath = Join-Path $stagingPath $remoteServiceTemplateName
+    if (-not (Test-Path -LiteralPath $remoteServiceTemplatePath -PathType Leaf)) {
+        throw "Remote-access service template is missing: $remoteServiceTemplateName"
+    }
+    $remoteAccessServices = [IO.File]::ReadAllText($remoteServiceTemplatePath).TrimEnd([char[]]"`r`n")
+
+    if ($RemoteAccessProvider -eq 'cloudflare') {
+        $remoteAccessIp = $cloudflarePrivateIp
+        $desktopRemoteNetworks = @'
+      remote_access:
+        ipv4_address: ${CLOUDFLARE_PRIVATE_IP}
+'@.TrimEnd([char[]]"`r`n")
+        $remoteAccessSecrets = @'
+  cloudflared_token:
+    file: ./secrets/cloudflared_tunnel_token
+'@.TrimEnd([char[]]"`r`n")
+        $remoteAccessVolumes = ''
+        $remoteAccessNetworks = @'
+  remote_access:
+    name: ${ENVIRONMENT_NAME}_remote_access
+    internal: true
+    ipam:
+      config:
+        - subnet: ${CLOUDFLARE_PRIVATE_SUBNET}
+  cloudflare_egress:
+    name: ${ENVIRONMENT_NAME}_cloudflare_egress
+'@.TrimEnd([char[]]"`r`n")
+        $remoteAccessSummary = 'Cloudflare Zero Trust remote access'
+        $remoteConnectionRows = @(
+            '| Remote SSH | `{0}:22` | `ssh -o IdentitiesOnly=yes -i "{1}" {2}@{0}` |' -f $remoteAccessIp, $targetSshPrivateKeyPath, $AccountName
+            '| Remote RDP | `{0}:3389` | `{1}` |' -f $remoteAccessIp, "${EnvironmentName}_remote.rdp"
+        ) -join "`n"
+        $tunnelIdDisplay = if ([string]::IsNullOrWhiteSpace($cloudflareTunnelId)) { 'pending (GenerateOnly)' } else { $cloudflareTunnelId }
+        $routeIdDisplay = if ([string]::IsNullOrWhiteSpace($cloudflareRouteId)) { 'pending (GenerateOnly)' } else { $cloudflareRouteId }
+        $remoteAccessInstructions = @'
+## Connect through Cloudflare Zero Trust
+
+1. Install Cloudflare One Client on the remote computer, enroll it in team **{{TEAM_NAME}}**, and enable WARP mode.
+2. Ensure the Zero Trust Split Tunnel and Gateway policies route and allow **{{PRIVATE_CIDR}}** on TCP ports 22 and 3389 for the intended user/device.
+3. Use the Remote SSH command or Remote RDP file above while WARP is connected.
+
+- Private desktop route: `{{PRIVATE_CIDR}}`
+- Tunnel ID: `{{TUNNEL_ID}}`
+- Route ID: `{{ROUTE_ID}}`
+
+Check the connector with:
+
+```text
+docker compose ps cloudflared
+docker compose logs --no-color --tail 100 cloudflared
+```
+
+The account API token is never copied into this environment. The tunnel-specific runtime token in `secrets/cloudflared_tunnel_token` is sensitive and must not be committed or shared.
+'@
+        $remoteAccessInstructions = $remoteAccessInstructions.Replace('{{TEAM_NAME}}', $cloudflareTeamName).
+            Replace('{{PRIVATE_CIDR}}', $cloudflarePrivateCidr).
+            Replace('{{TUNNEL_ID}}', $tunnelIdDisplay).
+            Replace('{{ROUTE_ID}}', $routeIdDisplay).TrimEnd([char[]]"`r`n")
+        $remoteDataWarning = 'Do not run `docker compose down -v`; it deletes DinD data and SSH host keys. Keep the Cloudflare tunnel token private.'
+    }
+    else {
+        $remoteAccessIp = $WireGuardIp
+        $desktopRemoteNetworks = '      remote_access: {}'
+        $remoteAccessSecrets = ''
+        $remoteAccessVolumes = @'
+  wireguard_state:
+    name: ${ENVIRONMENT_NAME}_wireguard_state
+'@.TrimEnd([char[]]"`r`n")
+        $remoteAccessNetworks = @'
+  remote_access:
+    name: ${ENVIRONMENT_NAME}_remote_access
+    internal: true
+  wireguard_transport:
+    name: ${ENVIRONMENT_NAME}_wireguard_transport
+'@.TrimEnd([char[]]"`r`n")
+        $remoteAccessSummary = 'WireGuard remote access'
+        $remoteConnectionRows = @(
+            '| Remote SSH | `{0}:22` | `ssh -o IdentitiesOnly=yes -i "{1}" {2}@{0}` |' -f $remoteAccessIp, $targetSshPrivateKeyPath, $AccountName
+            '| Remote RDP | `{0}:3389` | `{1}` |' -f $remoteAccessIp, "${EnvironmentName}_remote.rdp"
+        ) -join "`n"
+        $remoteAccessInstructions = @'
+## Register with the WireGuard Hub
+
+- Environment address: `{{WIREGUARD_ADDRESS}}`
+- VPN network: `{{WIREGUARD_NETWORK}}`
+- Hub endpoint: `{{WIREGUARD_HUB_ENDPOINT}}`
+
+After the first `docker compose up -d`, add `{{HUB_PEER_FILE}}` to the Hub and reload it. The Hub must forward authorized peers to `{{WIREGUARD_IP}}/32` on TCP ports 22 and 3389.
+
+If the public files are missing, export them again:
+
+```bash
+docker compose cp wireguard:/var/lib/wireguard/public.key {{PUBLIC_KEY_FILE}}
+docker compose cp wireguard:/var/lib/wireguard/hub_peer.conf {{HUB_PEER_FILE}}
+```
+
+Verify a nonzero handshake timestamp with `docker compose exec -T wireguard wg show wg0 latest-handshakes`, then test remote SSH and RDP.
+'@
+        $remoteAccessInstructions = $remoteAccessInstructions.Replace('{{WIREGUARD_ADDRESS}}', $WireGuardAddress).
+            Replace('{{WIREGUARD_NETWORK}}', $WireGuardNetwork).
+            Replace('{{WIREGUARD_HUB_ENDPOINT}}', $WireGuardHubEndpoint).
+            Replace('{{WIREGUARD_IP}}', $WireGuardIp).
+            Replace('{{PUBLIC_KEY_FILE}}', "wireguard/${EnvironmentName}_wireguard_public.key").
+            Replace('{{HUB_PEER_FILE}}', "wireguard/${EnvironmentName}_hub_peer.conf").TrimEnd([char[]]"`r`n")
+        $remoteDataWarning = 'Do not run `docker compose down -v`; it deletes DinD data, SSH host keys, and the WireGuard identity.'
+    }
+
     $tokens = @{
         ENVIRONMENT_NAME = $EnvironmentName
         ACCOUNT_NAME = $AccountName
@@ -1665,6 +2724,18 @@ try {
         WIREGUARD_IP = $WireGuardIp
         WIREGUARD_NETWORK = $WireGuardNetwork
         WIREGUARD_HUB_ENDPOINT = $WireGuardHubEndpoint
+        CLOUDFLARE_PRIVATE_IP = $cloudflarePrivateIp
+        CLOUDFLARE_PRIVATE_CIDR = $cloudflarePrivateCidr
+        CLOUDFLARE_PRIVATE_SUBNET = $cloudflareDockerSubnet
+        DESKTOP_REMOTE_NETWORKS = $desktopRemoteNetworks
+        REMOTE_ACCESS_SERVICES = $remoteAccessServices
+        REMOTE_ACCESS_SECRETS = $remoteAccessSecrets
+        REMOTE_ACCESS_VOLUMES = $remoteAccessVolumes
+        REMOTE_ACCESS_NETWORKS = $remoteAccessNetworks
+        REMOTE_ACCESS_SUMMARY = $remoteAccessSummary
+        REMOTE_CONNECTION_ROWS = $remoteConnectionRows
+        REMOTE_ACCESS_INSTRUCTIONS = $remoteAccessInstructions
+        REMOTE_DATA_WARNING = $remoteDataWarning
         SSH_PRIVATE_KEY = $targetSshPrivateKeyPath
         SSH_PUBLIC_KEY = $targetSshPublicKeyPath
         SSH_FINGERPRINT = $sshKeyMetadata.Fingerprint
@@ -1720,7 +2791,7 @@ try {
     }
     Expand-TemplateFile @localRdpTemplate
     $remoteRdpTokens = $tokens.Clone()
-    $remoteRdpTokens['RDP_FULL_ADDRESS'] = "${WireGuardIp}:3389"
+    $remoteRdpTokens['RDP_FULL_ADDRESS'] = "${remoteAccessIp}:3389"
     $remoteRdpTemplate = @{
         Source = Join-Path $stagingPath 'environment_VM.rdp.template'
         Destination = Join-Path $stagingPath $tokens['REMOTE_RDP_FILE']
@@ -1745,9 +2816,11 @@ try {
     Remove-Item -LiteralPath (Join-Path $stagingPath 'compose.gpu.yaml.template')
     Remove-Item -LiteralPath (Join-Path $stagingPath 'test_gpu.sh.template')
     Remove-Item -LiteralPath (Join-Path $stagingPath 'TestGpu.ps1.template')
+    Remove-Item -LiteralPath (Join-Path $stagingPath 'compose.cloudflare.services.template')
+    Remove-Item -LiteralPath (Join-Path $stagingPath 'compose.wireguard.services.template')
 
     $manifest = [ordered]@{
-        schemaVersion = 3
+        schemaVersion = 4
         generator = 'NewUbuntuDindEnvironment.ps1'
         generatedAt = [DateTime]::UtcNow.ToString('o')
         environmentName = $EnvironmentName
@@ -1764,7 +2837,18 @@ try {
         sshFingerprint = $sshKeyMetadata.Fingerprint
         localRdpFile = $tokens['LOCAL_RDP_FILE']
         remoteRdpFile = $tokens['REMOTE_RDP_FILE']
-        wireGuardRequired = $true
+        remoteAccessProvider = $RemoteAccessProvider
+        cloudflareAccountId = $cloudflareAccountId
+        cloudflareTeamName = $cloudflareTeamName
+        cloudflareTunnelName = $cloudflareTunnelName
+        cloudflareTunnelId = $cloudflareTunnelId
+        cloudflareRouteId = $cloudflareRouteId
+        cloudflarePrivateIp = $cloudflarePrivateIp
+        cloudflarePrivateCidr = $cloudflarePrivateCidr
+        cloudflareDockerSubnet = $cloudflareDockerSubnet
+        cloudflareTunnelTokenFile = if ($RemoteAccessProvider -eq 'cloudflare') { $cloudflareTunnelTokenFile } else { $null }
+        cloudflareProvisioningStatus = $cloudflareProvisioningStatus
+        wireGuardRequired = $RemoteAccessProvider -eq 'wireguard'
         wireGuardAddress = $WireGuardAddress
         wireGuardIp = $WireGuardIp
         wireGuardNetwork = $WireGuardNetwork
@@ -1773,10 +2857,10 @@ try {
         wireGuardMtu = $WireGuardMtu
         wireGuardKeepalive = $WireGuardKeepalive
         wireGuardPublicKey = $null
-        wireGuardPublicKeyPending = $true
-        wireGuardPublicKeyPath = $targetWireGuardPublicKeyPath
-        wireGuardHubPeerPath = $targetWireGuardHubPeerPath
-        wireGuardStateVolume = $tokens['WIREGUARD_STATE_VOLUME']
+        wireGuardPublicKeyPending = $RemoteAccessProvider -eq 'wireguard'
+        wireGuardPublicKeyPath = if ($RemoteAccessProvider -eq 'wireguard') { $targetWireGuardPublicKeyPath } else { $null }
+        wireGuardHubPeerPath = if ($RemoteAccessProvider -eq 'wireguard') { $targetWireGuardHubPeerPath } else { $null }
+        wireGuardStateVolume = if ($RemoteAccessProvider -eq 'wireguard') { $tokens['WIREGUARD_STATE_VOLUME'] } else { $null }
         desktopCpus = $DesktopCpus
         desktopCpusUnlimited = $desktopCpuUnlimited
         desktopMemory = $DesktopMemory
@@ -1818,7 +2902,9 @@ try {
     }
 
     if ($UseBuildKit) {
-        Invoke-Compose -ProjectPath $stagingPath -Arguments @('build', 'desktop', 'docker', 'wireguard') -FailureMessage 'Ubuntu 데스크톱/DinD/WireGuard 이미지 빌드에 실패했습니다.'
+        $buildServices = @('build', 'desktop', 'docker')
+        if ($RemoteAccessProvider -eq 'wireguard') { $buildServices += 'wireguard' }
+        Invoke-Compose -ProjectPath $stagingPath -Arguments $buildServices -FailureMessage 'Ubuntu 데스크톱/DinD 원격접속 이미지 빌드에 실패했습니다.'
     }
     else {
         # Docker Desktop's BuildKit resolves registry metadata even when the
@@ -1847,12 +2933,14 @@ try {
                 '--build-arg', "NVIDIA_CONTAINER_TOOLKIT_VERSION=$NvidiaContainerToolkitVersion",
                 $stagingPath
             ) -FailureMessage 'DinD 엔진 이미지 빌드에 실패했습니다.'
-            Invoke-Docker -Arguments @(
-                'build', '--pull=false',
-                '--tag', "${EnvironmentName}-wireguard:${imageTag}",
-                '--file', (Join-Path $stagingPath 'Dockerfile.wireguard'),
-                $stagingPath
-            ) -FailureMessage 'WireGuard sidecar 이미지 빌드에 실패했습니다.'
+            if ($RemoteAccessProvider -eq 'wireguard') {
+                Invoke-Docker -Arguments @(
+                    'build', '--pull=false',
+                    '--tag', "${EnvironmentName}-wireguard:${imageTag}",
+                    '--file', (Join-Path $stagingPath 'Dockerfile.wireguard'),
+                    $stagingPath
+                ) -FailureMessage 'WireGuard sidecar 이미지 빌드에 실패했습니다.'
+            }
         }
         finally {
             if ($null -eq $previousBuildKit) {
@@ -1923,8 +3011,15 @@ try {
 
     Invoke-Compose -ProjectPath $targetPath -Arguments @('up', '-d') -FailureMessage '새 환경 시작에 실패했습니다.'
     $newStarted = $true
-    Wait-EnvironmentHealthy -ProjectPath $targetPath
+    $healthServices = if ($RemoteAccessProvider -eq 'cloudflare') {
+        @('desktop', 'docker', 'cloudflared')
+    }
+    else {
+        @('desktop', 'docker', 'wireguard', 'remote_proxy')
+    }
+    Wait-EnvironmentHealthy -ProjectPath $targetPath -ServiceNames $healthServices
 
+    if ($RemoteAccessProvider -eq 'wireguard') {
     Export-WireGuardOutputs `
         -ProjectPath $targetPath `
         -PublicKeyDestination $targetWireGuardPublicKeyPath `
@@ -1941,6 +3036,7 @@ try {
     }
     $manifest['wireGuardPublicKey'] = $wireGuardPublicKey
     $manifest['wireGuardPublicKeyPending'] = $false
+    }
     [IO.File]::WriteAllText(
         (Join-Path $targetPath '.environment.json'),
         ($manifest | ConvertTo-Json -Depth 4),
@@ -1973,17 +3069,31 @@ CUDA 작업은 우선 데스크톱 컨테이너에서 실행하고, 중첩 CUDA�
         }
     }
 
+    if (-not [string]::IsNullOrWhiteSpace($createdCloudflareTunnelId)) {
+        $committedJournalPath = Join-Path $targetPath '.cloudflare-provisioning-transaction.json'
+        if (Test-Path -LiteralPath $committedJournalPath -PathType Leaf) {
+            Remove-Item -LiteralPath $committedJournalPath -Force
+        }
+    }
+
     Write-Host ''
     Write-Host "환경 생성 완료: $EnvironmentName"
     Write-Host "설정: $targetPath"
     Write-Host "영구 홈: $homeStoragePath"
     Write-Host "영구 작업공간: $workspaceStoragePath"
     Write-Host "Local SSH: ssh -o IdentitiesOnly=yes -i `"$targetSshPrivateKeyPath`" -p $SshPort $AccountName@$HostAddress"
-    Write-Host "Remote SSH: ssh -o IdentitiesOnly=yes -i `"$targetSshPrivateKeyPath`" -p 22 $AccountName@$WireGuardIp"
+    Write-Host "Remote SSH: ssh -o IdentitiesOnly=yes -i `"$targetSshPrivateKeyPath`" -p 22 $AccountName@$remoteAccessIp"
     Write-Host "Local RDP: $(Join-Path $targetPath $tokens['LOCAL_RDP_FILE'])"
     Write-Host "Remote RDP: $(Join-Path $targetPath $tokens['REMOTE_RDP_FILE'])"
-    Write-Host "WireGuard public key: $targetWireGuardPublicKeyPath"
-    Write-Host "WireGuard Hub peer: $targetWireGuardHubPeerPath"
+    if ($RemoteAccessProvider -eq 'cloudflare') {
+        Write-Host "Cloudflare Zero Trust team: $cloudflareTeamName"
+        Write-Host "Cloudflare private route: $cloudflarePrivateCidr"
+        Write-Host 'Connect the remote computer to the team with Cloudflare One Client (WARP) before SSH/RDP.'
+    }
+    else {
+        Write-Host "WireGuard public key: $targetWireGuardPublicKeyPath"
+        Write-Host "WireGuard Hub peer: $targetWireGuardHubPeerPath"
+    }
     Write-Host "자원: desktop=${desktopCpuDisplay} CPU/$desktopMemoryDisplay, DinD=${dindCpuDisplay} CPU/$dindMemoryDisplay"
     Write-Host "GPU: $gpuDescription"
     if ($null -ne $backupPath) {
@@ -2038,13 +3148,56 @@ catch {
         }
     }
 
+    $cloudflareMutationOutcomeUnknown = $null
+    if ($null -ne $failure.Exception.Data) {
+        $cloudflareMutationOutcomeUnknown = $failure.Exception.Data['CloudflareMutationOutcomeUnknown']
+    }
+    if ($null -ne $cloudflareMutationOutcomeUnknown) {
+        $cloudflareRollbackSucceeded = $false
+        Write-Warning 'A Cloudflare create request has an unknown outcome. The protected journal will reconcile it on the next run; no destructive retry was attempted.'
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($createdCloudflareTunnelId)) {
+        $cloudflareRollbackSucceeded = Remove-CloudflareProvisioningResources `
+            -AccountId $cloudflareAccountId `
+            -ApiToken $cloudflareApiToken `
+            -RouteId $createdCloudflareRouteId `
+            -TunnelId $createdCloudflareTunnelId
+        if ($cloudflareRollbackSucceeded) {
+            foreach ($journalCandidate in @(
+                    $cloudflareTransactionJournalPath,
+                    $(if ($null -ne $failedPath) { Join-Path $failedPath '.cloudflare-provisioning-transaction.json' })
+                )) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$journalCandidate) -and
+                    (Test-Path -LiteralPath $journalCandidate -PathType Leaf)) {
+                    Remove-Item -LiteralPath $journalCandidate -Force
+                }
+            }
+        }
+        else {
+            Write-Warning 'Cloudflare rollback is incomplete. Keep the protected transaction journal for the next run.'
+        }
+    }
+    if (-not $cloudflareRollbackSucceeded -and $null -ne $failedPath) {
+        $failedJournalPath = Join-Path $failedPath '.cloudflare-provisioning-transaction.json'
+        if (Test-Path -LiteralPath $failedJournalPath -PathType Leaf) {
+            $recoveryDirectory = Join-Path $stagingRoot "$EnvironmentName.recovery.$([Guid]::NewGuid().ToString('N'))"
+            New-Item -ItemType Directory -Path $recoveryDirectory -Force | Out-Null
+            Set-SecretAcl -Path $recoveryDirectory
+            $recoveryJournalPath = Join-Path $recoveryDirectory '.cloudflare-provisioning-transaction.json'
+            Move-Item -LiteralPath $failedJournalPath -Destination $recoveryJournalPath
+            Set-SecretAcl -Path $recoveryJournalPath
+        }
+    }
+
     throw $failure
 }
 finally {
+    $cloudflareApiToken = $null
+    $rootEnvironment = $null
     if ($null -ne $migrationPath -and (Test-Path -LiteralPath $migrationPath)) {
         Remove-Item -LiteralPath $migrationPath -Recurse -Force
     }
-    if (Test-Path -LiteralPath $stagingPath) {
+    if ($cloudflareRollbackSucceeded -and (Test-Path -LiteralPath $stagingPath)) {
         Remove-Item -LiteralPath $stagingPath -Recurse -Force
     }
     if (-not $completed -and -not $storageExistedBefore -and (Test-Path -LiteralPath $storagePath)) {

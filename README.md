@@ -1,85 +1,90 @@
-# Ubuntu Docker-in-Docker Environments
+# Ubuntu Docker Environments
 
-These scripts create Ubuntu 26.04 desktop environments with local and WireGuard-based remote RDP/SSH, persistent storage, optional NVIDIA CUDA, and an isolated Docker-in-Docker engine.
+Create Ubuntu 26.04 desktop environments with RDP, key-only SSH, persistent storage, optional NVIDIA CUDA, and an isolated Docker-in-Docker engine. New environments can use Cloudflare Zero Trust for remote access without a public IP, domain, or inbound port.
 
 ## Requirements
 
-- Docker Engine 28.0.0 or newer and Docker Compose 2.33.1 or newer
-- OpenSSH `ssh-keygen` for the generated PEM identity
-- A public WireGuard Hub with peer forwarding enabled
-- The Hub IPv4 endpoint (or a hostname with an IPv4 A record) and public key, plus a unique VPN address for each environment
-- Windows: Docker Desktop using the WSL2 backend
+- Docker Engine 28.0.0+ and Docker Compose 2.33.1+
+- OpenSSH `ssh-keygen`
+- Windows: Docker Desktop with the WSL2 backend
 - Ubuntu: rootful Docker, with your user allowed to run `docker`
 
-## Windows
+## Cloudflare setup (once)
 
-Run PowerShell:
+1. Create a Cloudflare Zero Trust organization and restrict device enrollment to your account.
+2. Set the Cloudflare One Client (WARP) device profile to **Traffic and DNS** mode.
+3. Ensure the private pool is routed through WARP. In **Include IPs and domains** mode, add the pool. In **Exclude IPs and domains** mode, split or replace any broader RFC1918 exclusion so that the pool is no longer excluded.
+4. Create an account API token limited to one account with:
+   - `Cloudflare One Connector: cloudflared` — Write
+   - `Cloudflare One Networks` — Write
+5. Copy `.env.example` to `.env` and fill in its four values. Do not quote, commit, or share the token.
+
+On Ubuntu, protect the configuration before running the generator:
+
+```bash
+chmod 600 .env
+```
+
+Choose an RFC1918 pool that does not overlap any LAN, Docker network, corporate VPN, or other Cloudflare private route. The default example is `10.210.0.0/16`.
+
+Install the Cloudflare One Client on each remote device, enroll it in the same Zero Trust organization, and connect WARP. Enable Gateway TCP proxying, then add policies that allow only approved users/devices to reach the assigned environment `/32` on TCP `22` and `3389`. The Docker host must be able to make outbound HTTPS connections; allow outbound port `7844` over UDP and TCP when an egress firewall filters traffic.
+
+## Create an environment
+
+Windows PowerShell:
 
 ```powershell
 cd D:\DockerVMs
 powershell -ExecutionPolicy Bypass -File .\NewUbuntuDindEnvironment.ps1
 ```
 
-Follow the prompts for the environment, local network, WireGuard Hub, VPN address, CPU, RAM, and GPU.
-
-## Ubuntu
-
-Make the scripts executable:
+Ubuntu:
 
 ```bash
 cd /path/to/DockerVMs
-chmod +x new_ubuntu_dind_environment.sh setup_nvidia_docker_host.sh
-```
-
-If the host has an NVIDIA GPU, prepare the host first:
-
-```bash
-sudo ./setup_nvidia_docker_host.sh
-```
-
-If a driver was installed, reboot and run the command again. The helper follows Ubuntu's recommended driver flow and configures NVIDIA Container Toolkit for Docker.
-
-Create an environment as your normal user:
-
-```bash
+chmod +x new_ubuntu_dind_environment.sh
 ./new_ubuntu_dind_environment.sh
 ```
 
-GPU detection defaults to `auto`. You can also use `--gpu on` or `--gpu off`.
+Cloudflare is the default for new environments; Ubuntu also offers `cloudflare`/`wireguard` at its prompt. The generator creates one remotely managed tunnel and one unique private `/32` route, then gives the environment only its tunnel-specific runtime token. The account API token remains in the root `.env` and is never copied into a generated environment or container.
 
-PowerShell scripts use `UpperCamelCase`; Linux shell scripts use `lower_snake_case`.
+Generated connection files:
 
-## Resource limits
+- `<environment>_local.rdp`: LAN address and published RDP port
+- `<environment>_remote.rdp`: Cloudflare private address on port `3389`
+- `<environment>_ssh.pem`: private key for both local and remote SSH
 
-Enter `-1` for any CPU or RAM prompt to remove that service's limit. Docker backend and host limits still apply. Rerun the generator to switch between limited and unlimited; editing `.env` alone does not add or remove Compose resource keys.
+Connect WARP before opening the remote RDP file or running the remote SSH command shown in the generated README. Cloudflare Tunnel connects outbound, so no inbound Cloudflare or WireGuard port is required on the Docker host.
 
-## After creation
+## Storage, limits, and GPU
 
-Each environment is stored in:
+Persistent data is stored under:
 
 ```text
-<root>/<environment>
-<root>/mount/<environment>/home
-<root>/mount/<environment>/workspace
+mount/<environment>/home
+mount/<environment>/workspace
 ```
 
-Each environment contains:
+Enter `-1` at a CPU or RAM prompt to remove that service's limit. Host and Docker backend limits still apply.
 
-- `<environment>_ssh.pem`: private key for both local and remote SSH
-- `<environment>_local.rdp`: LAN connection through the published host port
-- `<environment>_remote.rdp`: WireGuard connection to VPN port `3389`
-- `wireguard/<environment>_hub_peer.conf`: Hub peer block, created after first startup
+On an Ubuntu NVIDIA host, prepare Docker before enabling GPU support:
 
-Add the generated peer block to the Hub. Connect remote devices to that Hub and allow the environment VPN `/32`. SSH password authentication is disabled; the account password remains available for RDP and `sudo`.
+```bash
+chmod +x setup_nvidia_docker_host.sh
+sudo ./setup_nvidia_docker_host.sh
+```
 
-## Important notes
+Windows WSL2 can expose the GPU to the desktop and DinD services, but nested GPU containers depend on the Docker Desktop/WSL stack.
 
-- Host port `3389` is reserved and is never published or modified.
-- The environment WireGuard sidecar makes an outbound connection; no WireGuard port is published on the Docker host.
-- Assign a unique VPN address and use a WireGuard CIDR that does not overlap LAN, corporate VPN, or Docker networks.
-- Assign remote client tunnel addresses from that same WireGuard CIDR so reply traffic returns through the Hub.
-- Automatic VPN address selection is unique only within the current root directory. Reserve each `/32` across the entire Hub and all Docker hosts, and remove its Hub peer when deleting an environment.
-- Do not run `docker compose down -v`; it deletes DinD data, SSH host keys, and the WireGuard identity.
-- The DinD service is privileged. This is isolation for convenient development, not a VM-grade security boundary.
-- Treat Docker administrators and host accounts with Modify/Delete access to the selected root as trusted. Use a private root when host users are mutually untrusted.
-- Windows WSL2 supports GPU access in the desktop and DinD service, but nested GPU containers may fail. Native Ubuntu creation succeeds only after its nested CUDA check passes.
+## Legacy WireGuard mode
+
+The generators retain `wireguard` mode for existing deployments. It requires a separately reachable public WireGuard Hub, its public key and endpoint, and a unique VPN `/32`. Existing generated environments are not migrated or modified automatically.
+
+## Notes
+
+- Host port `3389` is reserved and is never published or changed.
+- SSH password login is disabled. The account password is used only for RDP and `sudo`.
+- The DinD daemon is privileged and is not a VM-grade security boundary.
+- Never commit the root `.env`, generated secrets, PEM keys, or tunnel tokens.
+- Do not run `docker compose down -v` unless permanent loss of DinD data and SSH host keys is intended.
+- Before deleting a Cloudflare environment, remove its `/32` route and tunnel using the IDs in `.environment.json`.

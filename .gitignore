@@ -1,4 +1,7 @@
-# Generated environments and runtime directories
+# Local VM environments and bind-mounted data
+/mount/
+
+# Other generated environments and runtime directories
 /*/
 !/templates/
 

@@ -18,7 +18,7 @@ param(
     [switch]$DisableGpu,
     [string]$CudaImage = 'nvidia/cuda:12.2.2-base-ubuntu22.04',
     [string]$NvidiaContainerToolkitVersion = '1.19.1-1',
-    [string]$RootPath = $PSScriptRoot,
+    [string]$RootPath,
     [switch]$Replace,
     [switch]$MigrateLegacyHome,
     [switch]$AllowDockerVersionChange,
@@ -573,7 +573,24 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     throw 'Docker CLI를 찾을 수 없습니다. Docker Desktop을 먼저 설치하고 실행하십시오.'
 }
 
-$rootFullPath = [IO.Path]::GetFullPath($RootPath).TrimEnd('\')
+if ([string]::IsNullOrWhiteSpace($RootPath)) {
+    $RootPath = $PSScriptRoot
+}
+if ([string]::IsNullOrWhiteSpace($RootPath)) {
+    throw '루트 경로를 확인할 수 없습니다. -RootPath로 경로를 지정하십시오.'
+}
+
+try {
+    $rootFullPath = [IO.Path]::GetFullPath($RootPath)
+}
+catch {
+    throw "루트 경로 형식이 올바르지 않습니다: '$RootPath'. $($_.Exception.Message)"
+}
+
+$rootPathRoot = [IO.Path]::GetPathRoot($rootFullPath)
+if ($rootFullPath.Length -gt $rootPathRoot.Length) {
+    $rootFullPath = $rootFullPath.TrimEnd([char[]]@('\', '/'))
+}
 $templatePath = Join-Path $PSScriptRoot 'templates\ubuntu-dind'
 if (-not (Test-Path -LiteralPath $templatePath -PathType Container)) {
     throw "템플릿 폴더가 없습니다: $templatePath"

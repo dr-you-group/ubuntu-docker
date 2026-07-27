@@ -137,6 +137,16 @@ readonly desktop_entrypoint="${repo_root}/templates/ubuntu-dind/docker_entrypoin
 assert_file_contains "${desktop_entrypoint}" '    chmod 0777 "${account_home}" /workspace'
 assert_file_contains "${desktop_entrypoint}" '    if ! runuser -u "${account_name}" -- test -w "${writable_path}"; then'
 
+readonly desktop_dockerfile="${repo_root}/templates/ubuntu-dind/Dockerfile"
+assert_file_contains "${desktop_dockerfile}" 'RUN if getent passwd ubuntu >/dev/null 2>&1; then userdel --remove ubuntu; fi \'
+assert_file_contains "${desktop_dockerfile}" '    && if getent group ubuntu >/dev/null 2>&1; then groupdel ubuntu; fi'
+ubuntu_cleanup_line="$(grep -n -F -- 'userdel --remove ubuntu' "${desktop_dockerfile}" | cut -d: -f1)"
+account_creation_line="$(grep -n -F -- 'groupadd --gid "${ACCOUNT_GID}"' "${desktop_dockerfile}" | cut -d: -f1)"
+[[ "${ubuntu_cleanup_line}" =~ ^[0-9]+$ && "${account_creation_line}" =~ ^[0-9]+$ ]] ||
+    fail 'Could not locate the Ubuntu account cleanup and generated account creation steps'
+(( ubuntu_cleanup_line < account_creation_line )) ||
+    fail 'Ubuntu UID/GID 1000 must be released before the generated account is created'
+
 readonly compose_template="${repo_root}/templates/ubuntu-dind/compose.yaml.template"
 grep -Fq -- '"${HOST_ADDRESS}:${RDP_PORT}:3389"' "${compose_template}" ||
     fail 'LAN RDP mapping is missing'

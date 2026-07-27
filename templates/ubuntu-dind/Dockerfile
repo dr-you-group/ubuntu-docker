@@ -14,6 +14,12 @@ ENV LANG=en_US.UTF-8 \
     TZ=Asia/Seoul \
     PATH=/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Ubuntu 26.04 reserves UID/GID 1000 for an unused default account. Remove it so
+# Linux hosts can map their current user into the desktop container without a
+# groupadd/useradd collision. The generated account is created below.
+RUN if getent passwd ubuntu >/dev/null 2>&1; then userdel --remove ubuntu; fi \
+    && if getent group ubuntu >/dev/null 2>&1; then groupdel ubuntu; fi
+
 # im-config must not select systemd-cat when the container has no journal socket.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \

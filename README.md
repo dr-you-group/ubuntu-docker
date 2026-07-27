@@ -8,6 +8,7 @@ New environments use Cloudflare Zero Trust by default, so they can be reached fr
 
 - [What this project creates](#what-this-project-creates)
 - [Requirements](#requirements)
+- [Run without host administrator privileges](#run-without-host-administrator-privileges)
 - [How Cloudflare remote access works](#how-cloudflare-remote-access-works)
 - [Cloudflare Zero Trust setup](#cloudflare-zero-trust-setup-one-time)
 - [Create an environment](#create-an-environment)
@@ -39,6 +40,30 @@ Host port `3389` remains reserved for the Windows server. The generator never pu
 - Ubuntu: rootful Docker, with your user allowed to run `docker`
 - Optional NVIDIA GPU on Ubuntu: a working host driver and NVIDIA Container Toolkit
 - Optional NVIDIA GPU on Windows: a compatible Windows NVIDIA driver and Docker Desktop/WSL2 GPU support
+
+## Run without host administrator privileges
+
+Both generators can create and start an environment without running the terminal as Administrator or using host `sudo`, provided that the host prerequisites are already installed and the current account can use Docker and write to the repository and selected output path. Skip the optional host-firewall step with the platform-specific option below.
+
+Windows PowerShell:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\NewUbuntuDindEnvironment.ps1 -SkipFirewall
+```
+
+Ubuntu shell:
+
+```bash
+./new_ubuntu_dind_environment.sh --skip-firewall
+```
+
+On Ubuntu, you can instead answer `n` when asked whether to apply the LAN-only Docker firewall policy. On Windows, pass `-SkipFirewall` when starting the command to prevent UAC elevation; canceling the later UAC prompt without this switch is treated as a generation failure. `-ExecutionPolicy Bypass` applies only to that PowerShell process and does not grant administrator rights.
+
+These options do not bypass Docker permissions: `docker info` must already succeed for the current account. Installing Docker Desktop or rootful Docker, enabling WSL2, installing Windows OpenSSH Client, granting Docker access, and installing optional GPU drivers or the NVIDIA Container Toolkit can still require an administrator. The Ubuntu generator requires rootful Docker and does not support rootless Docker; access to a rootful Docker daemon is effectively root-equivalent and must be limited to trusted users.
+
+Skipping the firewall step leaves the generated host firewall policy unapplied. Cloudflare remote access uses an outbound Tunnel and does not require an inbound firewall rule, while local SSH/RDP reachability and exposure are controlled by the host's existing firewall and network policy. An administrator can apply the generated firewall script later if host-enforced LAN restrictions are required.
+
+The login password requested by either generator belongs to the generated Ubuntu account. It is used for RDP and for `sudo` inside that container; it is not the Windows administrator password or the Ubuntu host's `sudo` password.
 
 ## How Cloudflare remote access works
 

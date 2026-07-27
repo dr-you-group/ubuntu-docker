@@ -416,10 +416,10 @@ function Read-CpuValue {
             [Globalization.NumberStyles]::Float,
             [Globalization.CultureInfo]::InvariantCulture,
             [ref]$parsed
-        ) -and $parsed -ge 0.25) {
+        ) -and ($parsed -eq -1 -or $parsed -ge 0.25)) {
             return $parsed
         }
-        Write-Warning 'CPU는 0.25 이상의 숫자로 입력하십시오.'
+        Write-Warning 'CPU는 -1(무제한) 또는 0.25 이상의 숫자로 입력하십시오.'
     }
 }
 
@@ -431,10 +431,13 @@ function Read-MemoryValue {
 
     while ($true) {
         $value = Read-WithDefault -Prompt $Prompt -Default $Default
+        if ($value -eq '-1') {
+            return $value
+        }
         if (Test-MemoryValue $value) {
             return $value.ToLowerInvariant()
         }
-        Write-Warning '메모리는 4096m 또는 4g 형식으로 입력하십시오.'
+        Write-Warning '메모리는 -1(무제한), 4096m 또는 4g 형식으로 입력하십시오.'
     }
 }
 
@@ -790,42 +793,53 @@ $logicalCpus = if ($null -ne $dockerBackend -and $dockerBackend.Cpus -gt 0) {
 else {
     [Math]::Max(1, [Environment]::ProcessorCount)
 }
-if ($DesktopCpus -le 0) {
-    $DesktopCpus = Read-CpuValue -Prompt 'Ubuntu 데스크톱 CPU 코어' -Default ([Math]::Min(2, $logicalCpus))
+if ($DesktopCpus -eq 0) {
+    $DesktopCpus = Read-CpuValue -Prompt 'Ubuntu 데스크톱 CPU 코어 (-1 = 무제한)' -Default ([Math]::Min(2, $logicalCpus))
 }
 if ([string]::IsNullOrWhiteSpace($DesktopMemory)) {
-    $DesktopMemory = Read-MemoryValue -Prompt 'Ubuntu 데스크톱 RAM' -Default '4g'
+    $DesktopMemory = Read-MemoryValue -Prompt 'Ubuntu 데스크톱 RAM (-1 = 무제한)' -Default '4g'
 }
-if ($DindCpus -le 0) {
-    $DindCpus = Read-CpuValue -Prompt 'DinD 엔진 및 내부 컨테이너 CPU 코어' -Default ([Math]::Min(4, $logicalCpus))
+if ($DindCpus -eq 0) {
+    $DindCpus = Read-CpuValue -Prompt 'DinD 엔진 및 내부 컨테이너 CPU 코어 (-1 = 무제한)' -Default ([Math]::Min(4, $logicalCpus))
 }
 if ([string]::IsNullOrWhiteSpace($DindMemory)) {
-    $DindMemory = Read-MemoryValue -Prompt 'DinD 엔진 및 내부 컨테이너 RAM' -Default '8g'
+    $DindMemory = Read-MemoryValue -Prompt 'DinD 엔진 및 내부 컨테이너 RAM (-1 = 무제한)' -Default '8g'
 }
 if ([double]::IsNaN($DesktopCpus) -or [double]::IsInfinity($DesktopCpus) -or
     [double]::IsNaN($DindCpus) -or [double]::IsInfinity($DindCpus) -or
-    $DesktopCpus -lt 0.25 -or $DindCpus -lt 0.25) {
-    throw 'CPU 값은 0.25 이상이어야 합니다.'
+    ($DesktopCpus -ne -1 -and $DesktopCpus -lt 0.25) -or
+    ($DindCpus -ne -1 -and $DindCpus -lt 0.25)) {
+    throw 'CPU 값은 -1(무제한) 또는 0.25 이상이어야 합니다.'
 }
-if (-not (Test-MemoryValue $DesktopMemory) -or -not (Test-MemoryValue $DindMemory)) {
-    throw '메모리는 4096m 또는 4g 형식이어야 합니다.'
+$DesktopMemory = $DesktopMemory.Trim().ToLowerInvariant()
+$DindMemory = $DindMemory.Trim().ToLowerInvariant()
+if (($DesktopMemory -ne '-1' -and -not (Test-MemoryValue $DesktopMemory)) -or
+    ($DindMemory -ne '-1' -and -not (Test-MemoryValue $DindMemory))) {
+    throw '메모리는 -1(무제한), 4096m 또는 4g 형식이어야 합니다.'
 }
-$DesktopMemory = $DesktopMemory.ToLowerInvariant()
-$DindMemory = $DindMemory.ToLowerInvariant()
 
-$desktopMemoryBytes = Convert-MemoryToBytes $DesktopMemory
-$dindMemoryBytes = Convert-MemoryToBytes $DindMemory
-if ($desktopMemoryBytes -lt 512MB -or $dindMemoryBytes -lt 512MB) {
+$desktopCpuUnlimited = $DesktopCpus -eq -1
+$desktopMemoryUnlimited = $DesktopMemory -eq '-1'
+$dindCpuUnlimited = $DindCpus -eq -1
+$dindMemoryUnlimited = $DindMemory -eq '-1'
+
+$desktopMemoryBytes = if ($desktopMemoryUnlimited) { $null } else { Convert-MemoryToBytes $DesktopMemory }
+$dindMemoryBytes = if ($dindMemoryUnlimited) { $null } else { Convert-MemoryToBytes $DindMemory }
+if ((-not $desktopMemoryUnlimited -and $desktopMemoryBytes -lt 512MB) -or
+    (-not $dindMemoryUnlimited -and $dindMemoryBytes -lt 512MB)) {
     throw 'Each service requires at least 512m of memory.'
 }
 if ($null -ne $dockerBackend) {
-    if ($DesktopCpus -gt $dockerBackend.Cpus -or $DindCpus -gt $dockerBackend.Cpus) {
+    if ((-not $desktopCpuUnlimited -and $DesktopCpus -gt $dockerBackend.Cpus) -or
+        (-not $dindCpuUnlimited -and $DindCpus -gt $dockerBackend.Cpus)) {
         Write-Warning "A service CPU limit exceeds the Docker backend capacity ($($dockerBackend.Cpus) CPUs)."
     }
-    if ($desktopMemoryBytes -gt $dockerBackend.MemoryBytes -or $dindMemoryBytes -gt $dockerBackend.MemoryBytes) {
+    if ((-not $desktopMemoryUnlimited -and $desktopMemoryBytes -gt $dockerBackend.MemoryBytes) -or
+        (-not $dindMemoryUnlimited -and $dindMemoryBytes -gt $dockerBackend.MemoryBytes)) {
         Write-Warning "A service memory limit exceeds the Docker backend capacity ($([Math]::Round($dockerBackend.MemoryBytes / 1GB, 2)) GiB)."
     }
-    if (($desktopMemoryBytes + $dindMemoryBytes) -gt $dockerBackend.MemoryBytes) {
+    if (-not $desktopMemoryUnlimited -and -not $dindMemoryUnlimited -and
+        ($desktopMemoryBytes + $dindMemoryBytes) -gt $dockerBackend.MemoryBytes) {
         Write-Warning 'The combined desktop and DinD memory limits exceed the Docker backend memory. This is allowed, but both services cannot reach their limits simultaneously.'
     }
 }
@@ -879,6 +893,14 @@ try {
 
     $desktopCpuText = $DesktopCpus.ToString('0.##', [Globalization.CultureInfo]::InvariantCulture)
     $dindCpuText = $DindCpus.ToString('0.##', [Globalization.CultureInfo]::InvariantCulture)
+    $desktopCpuDisplay = if ($desktopCpuUnlimited) { 'unlimited (-1)' } else { $desktopCpuText }
+    $desktopMemoryDisplay = if ($desktopMemoryUnlimited) { 'unlimited (-1)' } else { $DesktopMemory }
+    $dindCpuDisplay = if ($dindCpuUnlimited) { 'unlimited (-1)' } else { $dindCpuText }
+    $dindMemoryDisplay = if ($dindMemoryUnlimited) { 'unlimited (-1)' } else { $DindMemory }
+    $desktopCpuLimitToken = if ($desktopCpuUnlimited) { '# CPU limit: unlimited (-1)' } else { 'cpus: "${DESKTOP_CPUS}"' }
+    $desktopMemoryLimitToken = if ($desktopMemoryUnlimited) { '# Memory limit: unlimited (-1)' } else { 'mem_limit: ${DESKTOP_MEMORY}' }
+    $dindCpuLimitToken = if ($dindCpuUnlimited) { '# CPU limit: unlimited (-1)' } else { 'cpus: "${DIND_CPUS}"' }
+    $dindMemoryLimitToken = if ($dindMemoryUnlimited) { '# Memory limit: unlimited (-1)' } else { 'mem_limit: ${DIND_MEMORY}' }
     $storageComposePath = $storagePath.Replace('\', '/')
     $imageTag = "26.04-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss'))-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 
@@ -892,6 +914,7 @@ try {
         "SSH_PORT=$SshPort",
         "RDP_PORT=$RdpPort",
         "REMOTE_SUBNET=$RemoteSubnet",
+        '# A resource value of -1 means unlimited; the corresponding Compose limit is omitted.',
         "DESKTOP_CPUS=$desktopCpuText",
         "DESKTOP_MEMORY=$DesktopMemory",
         "DIND_CPUS=$dindCpuText",
@@ -934,10 +957,14 @@ try {
         WORKSPACE_STORAGE = $workspaceStoragePath
         PROJECT_PATH = $targetPath
         PROJECT_PATH_POWERSHELL = "'$($targetPath.Replace("'", "''"))'"
-        DESKTOP_CPUS = $desktopCpuText
-        DESKTOP_MEMORY = $DesktopMemory
-        DIND_CPUS = $dindCpuText
-        DIND_MEMORY = $DindMemory
+        DESKTOP_CPUS = $desktopCpuDisplay
+        DESKTOP_MEMORY = $desktopMemoryDisplay
+        DIND_CPUS = $dindCpuDisplay
+        DIND_MEMORY = $dindMemoryDisplay
+        DESKTOP_CPU_LIMIT = $desktopCpuLimitToken
+        DESKTOP_MEMORY_LIMIT = $desktopMemoryLimitToken
+        DIND_CPU_LIMIT = $dindCpuLimitToken
+        DIND_MEMORY_LIMIT = $dindMemoryLimitToken
         GPU_STATUS = $gpuDescription
         CUDA_IMAGE = $CudaImage
         HOST_PLATFORM = 'Windows'
@@ -945,6 +972,12 @@ try {
         GPU_TEST_COMMAND = "& '$(Join-Path $targetPath $gpuTestScriptName)'"
     }
 
+    $composeTemplate = @{
+        Source = Join-Path $stagingPath 'compose.yaml.template'
+        Destination = Join-Path $stagingPath 'compose.yaml'
+        Tokens = $tokens
+    }
+    Expand-TemplateFile @composeTemplate
     $readmeTemplate = @{
         Source = Join-Path $stagingPath 'README.md.template'
         Destination = Join-Path $stagingPath 'README.md'
@@ -974,6 +1007,7 @@ try {
             -Destination (Join-Path $stagingPath 'compose.override.yaml')
     }
     Remove-Item -LiteralPath (Join-Path $stagingPath 'README.md.template')
+    Remove-Item -LiteralPath (Join-Path $stagingPath 'compose.yaml.template')
     Remove-Item -LiteralPath (Join-Path $stagingPath 'ConfigureFirewall.ps1.template')
     Remove-Item -LiteralPath (Join-Path $stagingPath 'configure_firewall.sh.template')
     Remove-Item -LiteralPath (Join-Path $stagingPath 'environment_VM.rdp.template')
@@ -994,9 +1028,13 @@ try {
         rdpPort = $RdpPort
         hostPort3389Reserved = $true
         desktopCpus = $DesktopCpus
+        desktopCpusUnlimited = $desktopCpuUnlimited
         desktopMemory = $DesktopMemory
+        desktopMemoryUnlimited = $desktopMemoryUnlimited
         dindCpus = $DindCpus
+        dindCpusUnlimited = $dindCpuUnlimited
         dindMemory = $DindMemory
+        dindMemoryUnlimited = $dindMemoryUnlimited
         dockerVersion = $DockerVersion
         hostOs = 'windows'
         gpuEnabled = $gpuEnabled
@@ -1160,7 +1198,7 @@ CUDA 작업은 우선 데스크톱 컨테이너에서 실행하고, 중첩 CUDA�
     Write-Host "영구 작업공간: $workspaceStoragePath"
     Write-Host "SSH: ssh -p $SshPort $AccountName@$HostAddress"
     Write-Host "RDP: $(Join-Path $targetPath "${EnvironmentName}_VM.rdp")"
-    Write-Host "자원: desktop=${desktopCpuText} CPU/$DesktopMemory, DinD=${dindCpuText} CPU/$DindMemory"
+    Write-Host "자원: desktop=${desktopCpuDisplay} CPU/$desktopMemoryDisplay, DinD=${dindCpuDisplay} CPU/$dindMemoryDisplay"
     Write-Host "GPU: $gpuDescription"
     if ($null -ne $backupPath) {
         Write-Host "이전 설정 백업: $backupPath"

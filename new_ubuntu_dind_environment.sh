@@ -80,10 +80,10 @@ Network and resources:
   --remote-subnet CIDR
   --ssh-port PORT
   --rdp-port PORT               Must be 3390 or higher; host 3389 is reserved.
-  --desktop-cpus NUMBER
-  --desktop-memory SIZE         Example: 4g or 4096m.
-  --dind-cpus NUMBER
-  --dind-memory SIZE
+  --desktop-cpus NUMBER|-1      Use -1 for unlimited.
+  --desktop-memory SIZE|-1      Example: 4g or 4096m; use -1 for unlimited.
+  --dind-cpus NUMBER|-1         Use -1 for unlimited.
+  --dind-memory SIZE|-1         Example: 8g or 8192m; use -1 for unlimited.
 
 Docker and GPU:
   --docker-version X.Y.Z
@@ -333,6 +333,7 @@ validate_port_number() {
 
 validate_cpu_value() {
     local value="$1"
+    [[ "${value}" == -1 ]] && return 0
     # Requiring an integer part also keeps the value valid when written as a
     # JSON number in .environment.json (for example, use 0.5 rather than .5).
     [[ "${value}" =~ ^(0|[1-9][0-9]*)([.][0-9]+)?$ ]] || return 1
@@ -341,8 +342,21 @@ validate_cpu_value() {
 
 normalise_memory_value() {
     local value="${1,,}"
+    if [[ "${value}" == -1 ]]; then
+        printf '%s\n' "${value}"
+        return 0
+    fi
     [[ "${value}" =~ ^[1-9][0-9]*([.][0-9]+)?[mg]$ ]] || return 1
     printf '%s\n' "${value}"
+}
+
+resource_display_value() {
+    local value="$1"
+    if [[ "${value}" == -1 ]]; then
+        printf 'unlimited (-1)'
+    else
+        printf '%s' "${value}"
+    fi
 }
 
 memory_bytes() {
@@ -830,36 +844,48 @@ prepare_inputs() {
     old_value="$(read_environment_value "${old_env}" DESKTOP_CPUS || true)"
     default_value="$(( BACKEND_CPUS < 2 ? BACKEND_CPUS : 2 ))"
     validate_cpu_value "${old_value}" && default_value="${old_value}"
-    [[ -n "${DESKTOP_CPUS}" ]] || read_with_default DESKTOP_CPUS 'Desktop CPU cores' "${default_value}"
+    [[ -n "${DESKTOP_CPUS}" ]] || read_with_default DESKTOP_CPUS 'Desktop CPU cores (-1 for unlimited)' "${default_value}"
 
     old_value="$(read_environment_value "${old_env}" DIND_CPUS || true)"
     default_value="$(( BACKEND_CPUS < 4 ? BACKEND_CPUS : 4 ))"
     validate_cpu_value "${old_value}" && default_value="${old_value}"
-    [[ -n "${DIND_CPUS}" ]] || read_with_default DIND_CPUS 'DinD CPU cores' "${default_value}"
+    [[ -n "${DIND_CPUS}" ]] || read_with_default DIND_CPUS 'DinD CPU cores (-1 for unlimited)' "${default_value}"
 
     old_value="$(read_environment_value "${old_env}" DESKTOP_MEMORY || true)"
     default_value='4g'
     normalise_memory_value "${old_value}" >/dev/null 2>&1 && default_value="${old_value,,}"
-    [[ -n "${DESKTOP_MEMORY}" ]] || read_with_default DESKTOP_MEMORY 'Desktop RAM' "${default_value}"
+    [[ -n "${DESKTOP_MEMORY}" ]] || read_with_default DESKTOP_MEMORY 'Desktop RAM (-1 for unlimited)' "${default_value}"
 
     old_value="$(read_environment_value "${old_env}" DIND_MEMORY || true)"
     default_value='8g'
     normalise_memory_value "${old_value}" >/dev/null 2>&1 && default_value="${old_value,,}"
-    [[ -n "${DIND_MEMORY}" ]] || read_with_default DIND_MEMORY 'DinD RAM' "${default_value}"
-    validate_cpu_value "${DESKTOP_CPUS}" || die 'Desktop CPU must be a number greater than or equal to 0.25.'
-    validate_cpu_value "${DIND_CPUS}" || die 'DinD CPU must be a number greater than or equal to 0.25.'
-    DESKTOP_MEMORY="$(normalise_memory_value "${DESKTOP_MEMORY}")" || die 'Desktop RAM must use a value such as 4g or 4096m.'
-    DIND_MEMORY="$(normalise_memory_value "${DIND_MEMORY}")" || die 'DinD RAM must use a value such as 8g or 8192m.'
-    desktop_memory_bytes="$(memory_bytes "${DESKTOP_MEMORY}")"
-    dind_memory_bytes="$(memory_bytes "${DIND_MEMORY}")"
-    (( desktop_memory_bytes >= 536870912 && dind_memory_bytes >= 536870912 )) || die 'Each service needs at least 512m RAM.'
-    awk -v desktop="${DESKTOP_CPUS}" -v dind="${DIND_CPUS}" -v host="${BACKEND_CPUS}" \
-        'BEGIN { exit !(desktop > host || dind > host) }' &&
-        warn "A service CPU limit exceeds Docker capacity (${BACKEND_CPUS} CPUs)." || true
-    if (( desktop_memory_bytes > BACKEND_MEMORY_BYTES || dind_memory_bytes > BACKEND_MEMORY_BYTES )); then
+    [[ -n "${DIND_MEMORY}" ]] || read_with_default DIND_MEMORY 'DinD RAM (-1 for unlimited)' "${default_value}"
+    validate_cpu_value "${DESKTOP_CPUS}" || die 'Desktop CPU must be -1 (unlimited) or a number greater than or equal to 0.25.'
+    validate_cpu_value "${DIND_CPUS}" || die 'DinD CPU must be -1 (unlimited) or a number greater than or equal to 0.25.'
+    DESKTOP_MEMORY="$(normalise_memory_value "${DESKTOP_MEMORY}")" || die 'Desktop RAM must be -1 (unlimited) or use a value such as 4g or 4096m.'
+    DIND_MEMORY="$(normalise_memory_value "${DIND_MEMORY}")" || die 'DinD RAM must be -1 (unlimited) or use a value such as 8g or 8192m.'
+
+    desktop_memory_bytes='0'
+    if [[ "${DESKTOP_MEMORY}" != -1 ]]; then
+        desktop_memory_bytes="$(memory_bytes "${DESKTOP_MEMORY}")"
+        (( desktop_memory_bytes >= 536870912 )) || die 'Desktop RAM must be at least 512m or -1 (unlimited).'
+    fi
+    dind_memory_bytes='0'
+    if [[ "${DIND_MEMORY}" != -1 ]]; then
+        dind_memory_bytes="$(memory_bytes "${DIND_MEMORY}")"
+        (( dind_memory_bytes >= 536870912 )) || die 'DinD RAM must be at least 512m or -1 (unlimited).'
+    fi
+
+    if { [[ "${DESKTOP_CPUS}" != -1 ]] && awk -v value="${DESKTOP_CPUS}" -v host="${BACKEND_CPUS}" 'BEGIN { exit !(value > host) }'; } ||
+        { [[ "${DIND_CPUS}" != -1 ]] && awk -v value="${DIND_CPUS}" -v host="${BACKEND_CPUS}" 'BEGIN { exit !(value > host) }'; }; then
+        warn "A service CPU limit exceeds Docker capacity (${BACKEND_CPUS} CPUs)."
+    fi
+    if { [[ "${DESKTOP_MEMORY}" != -1 ]] && (( desktop_memory_bytes > BACKEND_MEMORY_BYTES )); } ||
+        { [[ "${DIND_MEMORY}" != -1 ]] && (( dind_memory_bytes > BACKEND_MEMORY_BYTES )); }; then
         warn 'A service RAM limit exceeds Docker backend memory.'
     fi
-    if (( desktop_memory_bytes + dind_memory_bytes > BACKEND_MEMORY_BYTES )); then
+    if [[ "${DESKTOP_MEMORY}" != -1 && "${DIND_MEMORY}" != -1 ]] &&
+        (( desktop_memory_bytes + dind_memory_bytes > BACKEND_MEMORY_BYTES )); then
         warn 'Combined service RAM limits exceed Docker backend memory.'
     fi
 
@@ -926,6 +952,9 @@ prepare_inputs() {
 
 write_environment_files() {
     local image_tag storage_env firewall_chain chain_prefix chain_hash firewall_script gpu_status gpu_test_command
+    local desktop_cpu_limit desktop_memory_limit dind_cpu_limit dind_memory_limit
+    local desktop_cpu_display desktop_memory_display dind_cpu_display dind_memory_display
+    local desktop_cpus_unlimited desktop_memory_unlimited dind_cpus_unlimited dind_memory_unlimited
     image_tag="26.04-$(date -u +%Y%m%d%H%M%S)-$(random_suffix)"
     storage_env="$(env_single_quoted "${STORAGE_PATH}")"
     chain_prefix="${ENVIRONMENT_NAME//-/_}"
@@ -941,6 +970,35 @@ write_environment_files() {
         gpu_test_command='./test_gpu.sh'
     fi
 
+    desktop_cpu_limit='cpus: "${DESKTOP_CPUS}"'
+    desktop_memory_limit='mem_limit: ${DESKTOP_MEMORY}'
+    dind_cpu_limit='cpus: "${DIND_CPUS}"'
+    dind_memory_limit='mem_limit: ${DIND_MEMORY}'
+    desktop_cpu_display="$(resource_display_value "${DESKTOP_CPUS}")"
+    desktop_memory_display="$(resource_display_value "${DESKTOP_MEMORY}")"
+    dind_cpu_display="$(resource_display_value "${DIND_CPUS}")"
+    dind_memory_display="$(resource_display_value "${DIND_MEMORY}")"
+    desktop_cpus_unlimited='false'
+    desktop_memory_unlimited='false'
+    dind_cpus_unlimited='false'
+    dind_memory_unlimited='false'
+    if [[ "${DESKTOP_CPUS}" == -1 ]]; then
+        desktop_cpu_limit='# CPU limit omitted: unlimited (-1).'
+        desktop_cpus_unlimited='true'
+    fi
+    if [[ "${DESKTOP_MEMORY}" == -1 ]]; then
+        desktop_memory_limit='# Memory limit omitted: unlimited (-1).'
+        desktop_memory_unlimited='true'
+    fi
+    if [[ "${DIND_CPUS}" == -1 ]]; then
+        dind_cpu_limit='# CPU limit omitted: unlimited (-1).'
+        dind_cpus_unlimited='true'
+    fi
+    if [[ "${DIND_MEMORY}" == -1 ]]; then
+        dind_memory_limit='# Memory limit omitted: unlimited (-1).'
+        dind_memory_unlimited='true'
+    fi
+
     cat >"${STAGING_PATH}/.env" <<EOF
 ENVIRONMENT_NAME=${ENVIRONMENT_NAME}
 ACCOUNT_NAME=${ACCOUNT_NAME}
@@ -950,6 +1008,7 @@ HOST_ADDRESS=${HOST_ADDRESS}
 SSH_PORT=${SSH_PORT}
 RDP_PORT=${RDP_PORT}
 REMOTE_SUBNET=${REMOTE_SUBNET}
+# A resource value of -1 means unlimited; the corresponding Compose limit is omitted.
 DESKTOP_CPUS=${DESKTOP_CPUS}
 DESKTOP_MEMORY=${DESKTOP_MEMORY}
 DIND_CPUS=${DIND_CPUS}
@@ -982,10 +1041,14 @@ EOF
         [WORKSPACE_STORAGE]="${WORKSPACE_STORAGE_PATH}"
         [PROJECT_PATH]="${TARGET_PATH}"
         [PROJECT_PATH_SHELL]="$(single_quote_shell_value "${TARGET_PATH}")"
-        [DESKTOP_CPUS]="${DESKTOP_CPUS}"
-        [DESKTOP_MEMORY]="${DESKTOP_MEMORY}"
-        [DIND_CPUS]="${DIND_CPUS}"
-        [DIND_MEMORY]="${DIND_MEMORY}"
+        [DESKTOP_CPUS]="${desktop_cpu_display}"
+        [DESKTOP_MEMORY]="${desktop_memory_display}"
+        [DIND_CPUS]="${dind_cpu_display}"
+        [DIND_MEMORY]="${dind_memory_display}"
+        [DESKTOP_CPU_LIMIT]="${desktop_cpu_limit}"
+        [DESKTOP_MEMORY_LIMIT]="${desktop_memory_limit}"
+        [DIND_CPU_LIMIT]="${dind_cpu_limit}"
+        [DIND_MEMORY_LIMIT]="${dind_memory_limit}"
         [HOST_PLATFORM]='Ubuntu/Linux'
         [FIREWALL_COMMAND]="sudo $(single_quote_shell_value "${firewall_script}")"
         [FIREWALL_CHAIN]="${firewall_chain}"
@@ -994,6 +1057,8 @@ EOF
         [GPU_TEST_COMMAND]="${gpu_test_command}"
     )
 
+    expand_template "${STAGING_PATH}/compose.yaml.template" "${STAGING_PATH}/compose.yaml"
+    chmod 0644 "${STAGING_PATH}/compose.yaml"
     expand_template "${STAGING_PATH}/README.md.template" "${STAGING_PATH}/README.md"
     expand_template "${STAGING_PATH}/environment_VM.rdp.template" "${STAGING_PATH}/${ENVIRONMENT_NAME}_VM.rdp"
     expand_template "${STAGING_PATH}/configure_firewall.sh.template" "${STAGING_PATH}/configure_${ENVIRONMENT_NAME_SNAKE}_firewall.sh"
@@ -1006,6 +1071,7 @@ EOF
     fi
 
     rm -f -- \
+        "${STAGING_PATH}/compose.yaml.template" \
         "${STAGING_PATH}/README.md.template" \
         "${STAGING_PATH}/environment_VM.rdp.template" \
         "${STAGING_PATH}/configure_firewall.sh.template" \
@@ -1032,9 +1098,13 @@ EOF
   "rdpPort": ${RDP_PORT},
   "hostPort3389Reserved": true,
   "desktopCpus": ${DESKTOP_CPUS},
+  "desktopCpusUnlimited": ${desktop_cpus_unlimited},
   "desktopMemory": "${DESKTOP_MEMORY}",
+  "desktopMemoryUnlimited": ${desktop_memory_unlimited},
   "dindCpus": ${DIND_CPUS},
+  "dindCpusUnlimited": ${dind_cpus_unlimited},
   "dindMemory": "${DIND_MEMORY}",
+  "dindMemoryUnlimited": ${dind_memory_unlimited},
   "dockerVersion": "${DOCKER_VERSION}",
   "imageTag": "${image_tag}",
   "gpuMode": "${GPU_MODE}",
@@ -1220,7 +1290,7 @@ main() {
     info "Persistent workspace: ${WORKSPACE_STORAGE_PATH}"
     info "SSH: ssh -p ${SSH_PORT} ${ACCOUNT_NAME}@${HOST_ADDRESS}"
     info "RDP file: ${TARGET_PATH}/${ENVIRONMENT_NAME}_VM.rdp"
-    info "Resources: desktop=${DESKTOP_CPUS} CPU/${DESKTOP_MEMORY}, DinD=${DIND_CPUS} CPU/${DIND_MEMORY}"
+    info "Resources: desktop=$(resource_display_value "${DESKTOP_CPUS}") CPU/$(resource_display_value "${DESKTOP_MEMORY}"), DinD=$(resource_display_value "${DIND_CPUS}") CPU/$(resource_display_value "${DIND_MEMORY}")"
     info "GPU: $([[ "${GPU_ENABLED}" == 1 ]] && printf 'enabled (%s)' "${CUDA_IMAGE}" || printf 'disabled')"
     [[ -z "${BACKUP_PATH}" ]] || info "Previous configuration backup: ${BACKUP_PATH}"
 }

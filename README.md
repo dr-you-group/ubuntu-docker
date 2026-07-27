@@ -1,6 +1,6 @@
 # Ubuntu Docker-in-Docker Environments
 
-Create Ubuntu 26.04 desktop environments with RDP, SSH, Firefox, Korean input, resource limits, persistent storage, and an isolated Docker-in-Docker engine.
+Create Ubuntu 26.04 desktop environments with RDP, SSH, Firefox, Korean input, optional resource limits, persistent storage, and an isolated Docker-in-Docker engine.
 
 ## Requirements
 
@@ -45,6 +45,10 @@ Create an environment as your normal user:
 GPU detection defaults to `auto`. You can also use `--gpu on` or `--gpu off`.
 
 PowerShell scripts use `UpperCamelCase`; Linux shell scripts use `lower_snake_case`.
+
+## Resource limits
+
+Enter `-1` for any CPU or RAM prompt to remove that service's limit. Docker backend and host limits still apply. Rerun the generator to switch between limited and unlimited; editing `.env` alone does not add or remove Compose resource keys.
 
 ## After creation
 

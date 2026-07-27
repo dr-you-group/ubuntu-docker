@@ -38,6 +38,8 @@ The Docker daemon is isolated in a separate DinD service and is available only t
 | Desktop | `__DESKTOP_CPUS__` | `__DESKTOP_MEMORY__` |
 | DinD and inner containers | `__DIND_CPUS__` | `__DIND_MEMORY__` |
 
+`unlimited (-1)` removes the per-service limit; Docker backend and host limits still apply. Rerun the generator to switch between limited and unlimited because editing `.env` alone does not add or remove Compose resource keys.
+
 ## NVIDIA GPU
 
 - Host platform: `__HOST_PLATFORM__`

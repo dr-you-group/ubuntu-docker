@@ -1,0 +1,26 @@
+FROM alpine:3.22
+
+LABEL org.opencontainers.image.title="DockerVM WireGuard remote-access sidecar"
+LABEL org.opencontainers.image.description="Outbound WireGuard peer with SSH and RDP TCP proxies"
+
+ENV WG_QUICK_USERSPACE_IMPLEMENTATION=wireguard-go
+
+RUN apk add --no-cache \
+        bash \
+        ca-certificates \
+        iproute2 \
+        socat \
+        wireguard-go \
+        wireguard-tools
+
+COPY wireguard_entrypoint.sh /usr/local/sbin/wireguard_entrypoint.sh
+COPY remote_proxy_entrypoint.sh /usr/local/sbin/remote_proxy_entrypoint.sh
+COPY remote_proxy_healthcheck.sh /usr/local/sbin/remote_proxy_healthcheck.sh
+
+RUN chmod 0755 \
+        /usr/local/sbin/wireguard_entrypoint.sh \
+        /usr/local/sbin/remote_proxy_entrypoint.sh \
+        /usr/local/sbin/remote_proxy_healthcheck.sh \
+    && mkdir -p /etc/wireguard /var/lib/wireguard
+
+ENTRYPOINT ["/usr/local/sbin/wireguard_entrypoint.sh"]

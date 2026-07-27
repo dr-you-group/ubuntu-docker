@@ -4,6 +4,10 @@
 .environment.json
 README.md
 *.rdp
+*.pem
+*.pem.pub
+wireguard
+wireguard/**
 Configure*Firewall.ps1
 configure_*_firewall.sh
 TestGpu.ps1

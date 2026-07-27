@@ -1,10 +1,13 @@
 # Ubuntu Docker-in-Docker Environments
 
-Create Ubuntu 26.04 desktop environments with RDP, SSH, Firefox, Korean input, optional resource limits, persistent storage, and an isolated Docker-in-Docker engine.
+These scripts create Ubuntu 26.04 desktop environments with local and WireGuard-based remote RDP/SSH, persistent storage, optional NVIDIA CUDA, and an isolated Docker-in-Docker engine.
 
 ## Requirements
 
-- Docker Engine and Docker Compose v2
+- Docker Engine 28.0.0 or newer and Docker Compose 2.33.1 or newer
+- OpenSSH `ssh-keygen` for the generated PEM identity
+- A public WireGuard Hub with peer forwarding enabled
+- The Hub IPv4 endpoint (or a hostname with an IPv4 A record) and public key, plus a unique VPN address for each environment
 - Windows: Docker Desktop using the WSL2 backend
 - Ubuntu: rootful Docker, with your user allowed to run `docker`
 
@@ -17,7 +20,7 @@ cd D:\DockerVMs
 powershell -ExecutionPolicy Bypass -File .\NewUbuntuDindEnvironment.ps1
 ```
 
-Follow the prompts for the environment name, account, password, network, ports, CPU, RAM, and GPU.
+Follow the prompts for the environment, local network, WireGuard Hub, VPN address, CPU, RAM, and GPU.
 
 ## Ubuntu
 
@@ -60,11 +63,23 @@ Each environment is stored in:
 <root>/mount/<environment>/workspace
 ```
 
-Open the generated `.rdp` file for RDP, or use the SSH command printed by the generator.
+Each environment contains:
+
+- `<environment>_ssh.pem`: private key for both local and remote SSH
+- `<environment>_local.rdp`: LAN connection through the published host port
+- `<environment>_remote.rdp`: WireGuard connection to VPN port `3389`
+- `wireguard/<environment>_hub_peer.conf`: Hub peer block, created after first startup
+
+Add the generated peer block to the Hub. Connect remote devices to that Hub and allow the environment VPN `/32`. SSH password authentication is disabled; the account password remains available for RDP and `sudo`.
 
 ## Important notes
 
 - Host port `3389` is reserved and is never published or modified.
-- Do not run `docker compose down -v`; it deletes DinD data and SSH host-key volumes.
+- The environment WireGuard sidecar makes an outbound connection; no WireGuard port is published on the Docker host.
+- Assign a unique VPN address and use a WireGuard CIDR that does not overlap LAN, corporate VPN, or Docker networks.
+- Assign remote client tunnel addresses from that same WireGuard CIDR so reply traffic returns through the Hub.
+- Automatic VPN address selection is unique only within the current root directory. Reserve each `/32` across the entire Hub and all Docker hosts, and remove its Hub peer when deleting an environment.
+- Do not run `docker compose down -v`; it deletes DinD data, SSH host keys, and the WireGuard identity.
 - The DinD service is privileged. This is isolation for convenient development, not a VM-grade security boundary.
+- Treat Docker administrators and host accounts with Modify/Delete access to the selected root as trusted. Use a private root when host users are mutually untrusted.
 - Windows WSL2 supports GPU access in the desktop and DinD service, but nested GPU containers may fail. Native Ubuntu creation succeeds only after its nested CUDA check passes.

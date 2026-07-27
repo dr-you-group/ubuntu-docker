@@ -4,6 +4,8 @@
 # Other generated environments and runtime directories
 /*/
 !/templates/
+!/.github/
+!/tests/
 
 # Credentials and host/runtime state
 **/.env

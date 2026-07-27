@@ -23,8 +23,8 @@ disable full window drag:i:0
 disable menu anims:i:0
 disable themes:i:0
 bitmapcachepersistenable:i:1
-full address:s:__HOST_ADDRESS__:__RDP_PORT__
-alternate full address:s:__HOST_ADDRESS__:__RDP_PORT__
+full address:s:__RDP_FULL_ADDRESS__
+alternate full address:s:__RDP_FULL_ADDRESS__
 username:s:__ACCOUNT_NAME__
 domain:s:
 prompt for credentials:i:1

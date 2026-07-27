@@ -9,6 +9,11 @@ param(
     [int]$SshPort = 0,
     [int]$RdpPort = 0,
     [string]$RemoteSubnet,
+    [string]$WireGuardHubEndpoint,
+    [string]$WireGuardHubPublicKey,
+    [string]$WireGuardAddress,
+    [int]$WireGuardMtu = 1380,
+    [int]$WireGuardKeepalive = 25,
     [double]$DesktopCpus = 0,
     [string]$DesktopMemory,
     [double]$DindCpus = 0,
@@ -20,6 +25,7 @@ param(
     [string]$NvidiaContainerToolkitVersion = '1.19.1-1',
     [string]$RootPath,
     [switch]$Replace,
+    [switch]$RotateSshKey,
     [switch]$MigrateLegacyHome,
     [switch]$AllowDockerVersionChange,
     [switch]$UseBuildKit,
@@ -41,6 +47,36 @@ function Read-WithDefault {
         return $Default
     }
     return $value.Trim()
+}
+
+function Read-RequiredValue {
+    param([Parameter(Mandatory)] [string]$Prompt)
+
+    while ($true) {
+        $value = Read-Host $Prompt
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            return $value.Trim()
+        }
+        Write-Warning '값을 반드시 입력하십시오.'
+    }
+}
+
+function Read-IntegerInRange {
+    param(
+        [Parameter(Mandatory)] [string]$Prompt,
+        [Parameter(Mandatory)] [int]$Default,
+        [Parameter(Mandatory)] [int]$Minimum,
+        [Parameter(Mandatory)] [int]$Maximum
+    )
+
+    while ($true) {
+        $raw = Read-WithDefault -Prompt $Prompt -Default ([string]$Default)
+        $parsed = 0
+        if ([int]::TryParse($raw, [ref]$parsed) -and $parsed -ge $Minimum -and $parsed -le $Maximum) {
+            return $parsed
+        }
+        Write-Warning "$Minimum 이상 $Maximum 이하의 정수를 입력하십시오."
+    }
 }
 
 function ConvertFrom-SecureValue {
@@ -184,6 +220,136 @@ function Test-Cidr {
     return [int]$Matches[2] -ge 8
 }
 
+function Get-IPv4CidrInfo {
+    param([Parameter(Mandatory)] [string]$Value)
+
+    if ($Value -notmatch '^(?<Address>(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3})/(?<Prefix>[0-9]|[12][0-9]|3[0-2])$') {
+        return $null
+    }
+
+    $address = $null
+    if (-not [Net.IPAddress]::TryParse($Matches['Address'], [ref]$address) -or
+        $address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) {
+        return $null
+    }
+
+    $prefixLength = [int]$Matches['Prefix']
+    $addressValue = [uint64]0
+    foreach ($octet in $address.GetAddressBytes()) {
+        $addressValue = ($addressValue * 256) + [uint64]$octet
+    }
+    $blockSize = [uint64][Math]::Pow(2, 32 - $prefixLength)
+    $networkValue = $addressValue - ($addressValue % $blockSize)
+    $broadcastValue = $networkValue + $blockSize - 1
+    $networkAddress = '{0}.{1}.{2}.{3}' -f `
+        (($networkValue -shr 24) -band 255),
+        (($networkValue -shr 16) -band 255),
+        (($networkValue -shr 8) -band 255),
+        ($networkValue -band 255)
+
+    return [pscustomobject]@{
+        Address = $address.IPAddressToString
+        PrefixLength = $prefixLength
+        AddressValue = $addressValue
+        NetworkValue = $networkValue
+        BroadcastValue = $broadcastValue
+        NetworkCidr = "$networkAddress/$prefixLength"
+    }
+}
+
+function Test-IPv4HostCidr {
+    param([string]$Value)
+
+    $cidr = Get-IPv4CidrInfo -Value $Value
+    if ($null -eq $cidr) {
+        return $false
+    }
+
+    if ($cidr.PrefixLength -lt 8 -or $cidr.PrefixLength -gt 29) {
+        return $false
+    }
+
+    $octets = @($cidr.Address.Split('.') | ForEach-Object { [int]$_ })
+    if ($octets[0] -eq 0 -or $octets[0] -eq 127 -or $octets[0] -ge 224 -or
+        ($octets[0] -eq 169 -and $octets[1] -eq 254)) {
+        return $false
+    }
+    if ($cidr.PrefixLength -le 30 -and
+        ($cidr.AddressValue -eq $cidr.NetworkValue -or $cidr.AddressValue -eq $cidr.BroadcastValue)) {
+        return $false
+    }
+    return $true
+}
+
+function Test-IPv4CidrsOverlap {
+    param(
+        [Parameter(Mandatory)] [string]$First,
+        [Parameter(Mandatory)] [string]$Second
+    )
+
+    $firstCidr = Get-IPv4CidrInfo -Value $First
+    $secondCidr = Get-IPv4CidrInfo -Value $Second
+    if ($null -eq $firstCidr -or $null -eq $secondCidr) {
+        throw 'CIDR overlap validation received an invalid IPv4 CIDR.'
+    }
+    return $firstCidr.NetworkValue -le $secondCidr.BroadcastValue -and
+        $secondCidr.NetworkValue -le $firstCidr.BroadcastValue
+}
+
+function Test-WireGuardEndpoint {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+
+    $endpointHost = $null
+    $endpointPort = 0
+    if ($Value -match '^(?<Host>[^:\[\]\s]+):(?<Port>[0-9]{1,5})$') {
+        $endpointHost = $Matches['Host']
+        $endpointPort = [int]$Matches['Port']
+        $parsedAddress = $null
+        if ([Net.IPAddress]::TryParse($endpointHost, [ref]$parsedAddress)) {
+            if ($parsedAddress.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) {
+                return $false
+            }
+        }
+        elseif ($endpointHost -match '^[0-9.]+$' -or
+            $endpointHost.Length -gt 253 -or
+            $endpointHost -notmatch '^(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$') {
+            return $false
+        }
+    }
+    else {
+        return $false
+    }
+
+    return $endpointPort -ge 1 -and $endpointPort -le 65535
+}
+
+function Test-WireGuardPublicKey {
+    param([string]$Value)
+
+    if ($Value -notmatch '^[A-Za-z0-9+/]{43}=$') {
+        return $false
+    }
+    try {
+        $decoded = [Convert]::FromBase64String($Value)
+        if ($decoded.Length -ne 32) {
+            return $false
+        }
+        foreach ($byte in $decoded) {
+            if ($byte -ne 0) {
+                return $true
+            }
+        }
+        return $false
+    }
+    catch {
+        return $false
+    }
+}
+
 function Get-ActiveTcpPorts {
     return [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners().Port |
         Sort-Object -Unique
@@ -280,6 +446,37 @@ function Read-EnvironmentFile {
         }
     }
     return $values
+}
+
+function Get-WireGuardAddressOwners {
+    param(
+        [Parameter(Mandatory)] [string]$RootPath,
+        [Parameter(Mandatory)] [string]$ExcludedEnvironmentName
+    )
+
+    $owners = @()
+    foreach ($directory in @(Get-ChildItem -LiteralPath $RootPath -Directory -Force -ErrorAction SilentlyContinue)) {
+        if ($directory.Name -eq $ExcludedEnvironmentName) {
+            continue
+        }
+        $environmentFile = Join-Path $directory.FullName '.env'
+        if (-not (Test-Path -LiteralPath $environmentFile -PathType Leaf)) {
+            continue
+        }
+        $environmentValues = Read-EnvironmentFile -Path $environmentFile
+        if (-not $environmentValues.ContainsKey('WIREGUARD_ADDRESS')) {
+            continue
+        }
+        $cidr = Get-IPv4CidrInfo -Value $environmentValues['WIREGUARD_ADDRESS']
+        if ($null -ne $cidr) {
+            $owners += [pscustomobject]@{
+                EnvironmentName = $directory.Name
+                Address = $cidr.Address
+                EnvironmentFile = $environmentFile
+            }
+        }
+    }
+    return @($owners)
 }
 
 function Test-MemoryValue {
@@ -445,17 +642,126 @@ function Set-SecretAcl {
     param([Parameter(Mandatory)] [string]$Path)
 
     $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $permission = if (Test-Path -LiteralPath $Path -PathType Container) { '(OI)(CI)(F)' } else { '(F)' }
     $arguments = @(
         $Path,
         '/inheritance:r',
         '/grant:r',
-        "*${currentSid}:(F)",
-        '*S-1-5-18:(F)',
-        '*S-1-5-32-544:(F)'
+        "*${currentSid}:$permission",
+        "*S-1-5-18:$permission",
+        "*S-1-5-32-544:$permission"
     )
     & icacls.exe @arguments | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "비밀번호 파일 ACL 설정에 실패했습니다: $Path"
+        throw "보안 파일 또는 디렉터리 ACL 설정에 실패했습니다: $Path"
+    }
+}
+
+function New-SshPemKeyPair {
+    param(
+        [Parameter(Mandatory)] [string]$PrivateKeyPath,
+        [Parameter(Mandatory)] [string]$Comment
+    )
+
+    $sshKeygen = Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue
+    if ($null -eq $sshKeygen) {
+        throw 'ssh-keygen.exe를 찾을 수 없습니다. Windows OpenSSH Client를 설치하십시오.'
+    }
+    if ((Test-Path -LiteralPath $PrivateKeyPath) -or (Test-Path -LiteralPath "$PrivateKeyPath.pub")) {
+        throw "SSH 키 생성 대상이 이미 존재합니다: $PrivateKeyPath"
+    }
+
+    # Windows PowerShell 5.1 drops a native empty-string argument. A literal
+    # pair of quotes is required so ssh-keygen receives an empty passphrase.
+    & $sshKeygen.Source -q -t rsa -b 4096 -m PEM -N '""' -C $Comment -f $PrivateKeyPath
+    $keygenExitCode = $LASTEXITCODE
+    if ($keygenExitCode -ne 0 -or
+        -not (Test-Path -LiteralPath $PrivateKeyPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath "$PrivateKeyPath.pub" -PathType Leaf)) {
+        throw "RSA PEM SSH 키 생성에 실패했습니다(종료 코드 $keygenExitCode)."
+    }
+}
+
+function Write-SshCanonicalPublicKey {
+    param(
+        [Parameter(Mandatory)] [string]$PrivateKeyPath,
+        [Parameter(Mandatory)] [string]$PublicKeyPath,
+        [Parameter(Mandatory)] [string]$Comment
+    )
+
+    $sshKeygen = Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue
+    if ($null -eq $sshKeygen) {
+        throw 'ssh-keygen.exe를 찾을 수 없습니다. Windows OpenSSH Client를 설치하십시오.'
+    }
+    $derivedLines = @(& $sshKeygen.Source -y -P '""' -f $PrivateKeyPath 2>$null |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $deriveExitCode = $LASTEXITCODE
+    if ($deriveExitCode -ne 0 -or $derivedLines.Count -ne 1) {
+        throw 'SSH private key에서 단일 public key를 생성하지 못했습니다.'
+    }
+    $derivedParts = ([string]$derivedLines[0]).Trim() -split '\s+'
+    if ($derivedParts.Count -ne 2 -or $derivedParts[0] -ne 'ssh-rsa') {
+        throw 'SSH private key에서 올바른 RSA public key를 생성하지 못했습니다.'
+    }
+
+    $canonicalPublicKey = "ssh-rsa $($derivedParts[1]) $Comment"
+    [IO.File]::WriteAllText(
+        $PublicKeyPath,
+        "$canonicalPublicKey`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+}
+
+function Get-SshKeyPairMetadata {
+    param(
+        [Parameter(Mandatory)] [string]$PrivateKeyPath,
+        [Parameter(Mandatory)] [string]$PublicKeyPath
+    )
+
+    if (-not (Test-Path -LiteralPath $PrivateKeyPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $PublicKeyPath -PathType Leaf)) {
+        throw 'SSH private/public key pair is incomplete.'
+    }
+    $privateHeader = Get-Content -LiteralPath $PrivateKeyPath -Encoding ASCII -TotalCount 1
+    if ([string]$privateHeader -ne '-----BEGIN RSA PRIVATE KEY-----') {
+        throw 'SSH private key is not an RSA PEM key.'
+    }
+
+    $sshKeygen = Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue
+    if ($null -eq $sshKeygen) {
+        throw 'ssh-keygen.exe를 찾을 수 없습니다. Windows OpenSSH Client를 설치하십시오.'
+    }
+    $derivedPublic = @(& $sshKeygen.Source -y -P '""' -f $PrivateKeyPath 2>$null |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $deriveExitCode = $LASTEXITCODE
+    if ($deriveExitCode -ne 0 -or $derivedPublic.Count -ne 1) {
+        throw 'SSH private key validation failed.'
+    }
+
+    $publicLines = @(Get-Content -LiteralPath $PublicKeyPath -Encoding ASCII |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($publicLines.Count -ne 1) {
+        throw 'SSH public key file must contain exactly one non-empty line.'
+    }
+    $publicLine = $publicLines[0]
+    $derivedParts = ([string]$derivedPublic[0]).Trim() -split '\s+'
+    $publicParts = ([string]$publicLine).Trim() -split '\s+'
+    if ($derivedParts.Count -lt 2 -or $publicParts.Count -lt 2 -or
+        $derivedParts[0] -ne 'ssh-rsa' -or $publicParts[0] -ne 'ssh-rsa' -or
+        $derivedParts[1] -ne $publicParts[1]) {
+        throw 'SSH public key does not match the RSA private key.'
+    }
+
+    $fingerprintOutput = @(& $sshKeygen.Source -l -E sha256 -f $PublicKeyPath 2>$null)
+    $fingerprintExitCode = $LASTEXITCODE
+    $fingerprint = if ($fingerprintOutput.Count -gt 0) { ([string]$fingerprintOutput[0]).Trim() } else { '' }
+    if ($fingerprintExitCode -ne 0 -or $fingerprint -notmatch '^4096\s+SHA256:[A-Za-z0-9+/]+') {
+        throw 'SSH key must be a valid 4096-bit RSA key.'
+    }
+
+    return [pscustomobject]@{
+        PublicKey = "ssh-rsa $($publicParts[1])"
+        Fingerprint = $fingerprint
     }
 }
 
@@ -467,9 +773,17 @@ function Expand-TemplateFile {
     )
 
     $content = [IO.File]::ReadAllText($Source)
-    foreach ($token in $Tokens.GetEnumerator()) {
-        $content = $content.Replace("__$($token.Key)__", [string]$token.Value)
+    $tokenPattern = '__([A-Z][A-Z0-9_]*)__'
+    $tokenEvaluator = [Text.RegularExpressions.MatchEvaluator] {
+        param([Text.RegularExpressions.Match]$Match)
+
+        $key = $Match.Groups[1].Value
+        if (-not $Tokens.ContainsKey($key)) {
+            throw "템플릿 토큰 값이 없습니다: __${key}__ ($Source)"
+        }
+        return [string]$Tokens[$key]
     }
+    $content = [Text.RegularExpressions.Regex]::Replace($content, $tokenPattern, $tokenEvaluator)
     $writeBom = [IO.Path]::GetExtension($Destination) -ieq '.ps1'
     [IO.File]::WriteAllText($Destination, $content, [Text.UTF8Encoding]::new($writeBom))
 }
@@ -514,6 +828,128 @@ function Invoke-Compose {
     }
 }
 
+function Export-WireGuardOutputs {
+    param(
+        [Parameter(Mandatory)] [string]$ProjectPath,
+        [Parameter(Mandatory)] [string]$PublicKeyDestination,
+        [Parameter(Mandatory)] [string]$HubPeerDestination,
+        [Parameter(Mandatory)] [string]$ExpectedWireGuardIp,
+        [Parameter(Mandatory)] [string]$EnvironmentName
+    )
+
+    $outputDirectory = Split-Path -Parent $PublicKeyDestination
+    if ($outputDirectory -ne (Split-Path -Parent $HubPeerDestination)) {
+        throw 'WireGuard output files must share one directory.'
+    }
+    New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+    $outputDirectoryItem = Get-Item -LiteralPath $outputDirectory -Force
+    if (($outputDirectoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "WireGuard output directory must not be a reparse point: $outputDirectory"
+    }
+    Set-SecretAcl -Path $outputDirectory
+
+    $temporaryDirectory = Join-Path $outputDirectory ".$([Guid]::NewGuid().ToString('N')).export"
+    try {
+        New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+        $temporaryDirectoryItem = Get-Item -LiteralPath $temporaryDirectory -Force
+        if (($temporaryDirectoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "WireGuard temporary output directory must not be a reparse point: $temporaryDirectory"
+        }
+        Set-SecretAcl -Path $temporaryDirectory
+        $temporaryPublicKey = Join-Path $temporaryDirectory 'public.key'
+        $temporaryHubPeer = Join-Path $temporaryDirectory 'hub_peer.conf'
+        $publicKeyBackup = Join-Path $temporaryDirectory 'previous-public.key'
+        $hubPeerBackup = Join-Path $temporaryDirectory 'previous-hub_peer.conf'
+
+        Invoke-Compose -ProjectPath $ProjectPath `
+            -Arguments @('cp', 'wireguard:/var/lib/wireguard/public.key', $temporaryPublicKey) `
+            -FailureMessage 'WireGuard public key를 host로 복사하지 못했습니다.' | Out-Host
+
+        if (-not (Test-Path -LiteralPath $temporaryPublicKey -PathType Leaf)) {
+            throw 'WireGuard sidecar public-key copy is incomplete.'
+        }
+        $publicKeyLines = @([IO.File]::ReadAllLines($temporaryPublicKey) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($publicKeyLines.Count -ne 1) {
+            throw 'WireGuard public key output must contain exactly one non-empty line.'
+        }
+        $publicKey = $publicKeyLines[0].Trim()
+        if (-not (Test-WireGuardPublicKey $publicKey)) {
+            throw 'WireGuard sidecar generated an invalid public key.'
+        }
+
+        $hubPeerContent = @"
+# Add this peer to the public WireGuard Hub, then reload the Hub configuration.
+[Peer]
+# DockerVM environment: $EnvironmentName
+PublicKey = $publicKey
+AllowedIPs = $ExpectedWireGuardIp/32
+"@
+        [IO.File]::WriteAllText(
+            $temporaryHubPeer,
+            "$hubPeerContent`n",
+            [Text.UTF8Encoding]::new($false)
+        )
+
+        $hubPeerContent = [IO.File]::ReadAllText($temporaryHubPeer)
+        $escapedPublicKey = [regex]::Escape($publicKey)
+        $escapedAllowedIp = [regex]::Escape("$ExpectedWireGuardIp/32")
+        if ($hubPeerContent -match '(?m)^\s*PrivateKey\s*=' -or
+            $hubPeerContent -notmatch '(?m)^\[Peer\]\s*$' -or
+            $hubPeerContent -notmatch "(?m)^PublicKey\s*=\s*$escapedPublicKey\s*$" -or
+            $hubPeerContent -notmatch "(?m)^AllowedIPs\s*=\s*$escapedAllowedIp\s*$") {
+            throw 'WireGuard Hub peer output does not match the generated public key/address.'
+        }
+
+        if (Test-Path -LiteralPath $PublicKeyDestination -PathType Container) {
+            throw "WireGuard public key destination is a directory: $PublicKeyDestination"
+        }
+        if (Test-Path -LiteralPath $HubPeerDestination -PathType Container) {
+            throw "WireGuard Hub peer destination is a directory: $HubPeerDestination"
+        }
+        if (Test-Path -LiteralPath $PublicKeyDestination -PathType Leaf) {
+            [IO.File]::Replace($temporaryPublicKey, $PublicKeyDestination, $publicKeyBackup)
+        }
+        else {
+            [IO.File]::Move($temporaryPublicKey, $PublicKeyDestination)
+        }
+        if (Test-Path -LiteralPath $HubPeerDestination -PathType Leaf) {
+            [IO.File]::Replace($temporaryHubPeer, $HubPeerDestination, $hubPeerBackup)
+        }
+        else {
+            [IO.File]::Move($temporaryHubPeer, $HubPeerDestination)
+        }
+        Set-SecretAcl -Path $PublicKeyDestination
+        Set-SecretAcl -Path $HubPeerDestination
+
+        $exportedPublicKey = ([IO.File]::ReadAllText($PublicKeyDestination)).Trim()
+        $exportedHubPeer = [IO.File]::ReadAllText($HubPeerDestination)
+        if ($exportedPublicKey -ne $publicKey -or
+            $exportedHubPeer -match '(?m)^\s*PrivateKey\s*=' -or
+            $exportedHubPeer -notmatch '(?m)^\[Peer\]\s*$' -or
+            $exportedHubPeer -notmatch "(?m)^PublicKey\s*=\s*$escapedPublicKey\s*$" -or
+            $exportedHubPeer -notmatch "(?m)^AllowedIPs\s*=\s*$escapedAllowedIp\s*$") {
+            throw 'WireGuard host output verification failed after the atomic move.'
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryDirectory) {
+            $expectedParent = [IO.Path]::GetFullPath($outputDirectory).TrimEnd('\')
+            $actualParent = [IO.Path]::GetFullPath((Split-Path -Parent $temporaryDirectory)).TrimEnd('\')
+            if ($actualParent -ne $expectedParent) {
+                throw "Refusing to remove an unexpected WireGuard temporary directory: $temporaryDirectory"
+            }
+            $temporaryItem = Get-Item -LiteralPath $temporaryDirectory -Force
+            if (($temporaryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Remove-Item -LiteralPath $temporaryDirectory -Force
+            }
+            else {
+                Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force
+            }
+        }
+    }
+}
+
 function Test-ComposeCommand {
     param(
         [Parameter(Mandatory)] [string]$ProjectPath,
@@ -533,34 +969,107 @@ function Test-ComposeCommand {
     }
 }
 
+function Assert-DockerComposeVersion {
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $versionOutput = @()
+    $composeExitCode = -1
+    try {
+        $versionOutput = @(& docker compose version --short 2>$null)
+        $composeExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    $versionText = if ($versionOutput.Count -gt 0) { ([string]$versionOutput[0]).Trim() } else { '' }
+    if ($composeExitCode -ne 0 -or
+        $versionText -notmatch '^v?(?<Major>[0-9]+)\.(?<Minor>[0-9]+)\.(?<Patch>[0-9]+)(?:[-+].*)?$') {
+        throw "Docker Compose version을 확인할 수 없습니다. Compose 2.33.1 이상이 필요합니다. 감지값: '$versionText'"
+    }
+    $major = [int]$Matches['Major']
+    $minor = [int]$Matches['Minor']
+    $patch = [int]$Matches['Patch']
+    $supported = $major -gt 2 -or
+        ($major -eq 2 -and ($minor -gt 33 -or ($minor -eq 33 -and $patch -ge 1)))
+    if (-not $supported) {
+        throw "Docker Compose $versionText 은 지원되지 않습니다. gw_priority를 지원하는 Compose 2.33.1 이상으로 업그레이드하십시오."
+    }
+}
+
+function Assert-DockerEngineVersion {
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $versionOutput = @()
+    $engineExitCode = -1
+    try {
+        $versionOutput = @(& docker version --format '{{.Server.Version}}' 2>$null)
+        $engineExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    $versionText = if ($versionOutput.Count -gt 0) { ([string]$versionOutput[0]).Trim() } else { '' }
+    if ($engineExitCode -ne 0 -or
+        $versionText -notmatch '^v?(?<Major>[0-9]+)\.(?<Minor>[0-9]+)\.(?<Patch>[0-9]+)(?:[-+].*)?$') {
+        throw "Docker Engine server version을 확인할 수 없습니다. Engine 28.0.0 이상이 필요합니다. 감지값: '$versionText'"
+    }
+    $major = [int]$Matches['Major']
+    $minor = [int]$Matches['Minor']
+    $patch = [int]$Matches['Patch']
+    $supported = $major -gt 28 -or
+        ($major -eq 28 -and ($minor -gt 0 -or ($minor -eq 0 -and $patch -ge 0)))
+    if (-not $supported) {
+        throw "Docker Engine $versionText 은 지원되지 않습니다. gw_priority를 지원하는 Engine 28.0.0 이상으로 업그레이드하십시오."
+    }
+}
+
+function Write-EnvironmentServiceLogs {
+    param([Parameter(Mandatory)] [string]$ProjectPath)
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    Push-Location $ProjectPath
+    try {
+        & docker compose --env-file .env logs --no-color --tail 100 desktop docker wireguard remote_proxy
+    }
+    finally {
+        Pop-Location
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
 function Wait-EnvironmentHealthy {
     param(
         [Parameter(Mandatory)] [string]$ProjectPath,
         [int]$TimeoutSeconds = 600
     )
 
+    $serviceNames = @('desktop', 'docker', 'wireguard', 'remote_proxy')
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
         Push-Location $ProjectPath
         try {
-            $desktopId = [string](& docker compose --env-file .env ps -q desktop)
-            if ($LASTEXITCODE -ne 0) {
-                throw 'Failed to inspect the desktop service.'
+            $containerIds = @{}
+            foreach ($serviceName in $serviceNames) {
+                $containerId = [string](& docker compose --env-file .env ps -q $serviceName)
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Failed to inspect the $serviceName service."
+                }
+                $containerIds[$serviceName] = $containerId.Trim()
             }
-            $dockerId = [string](& docker compose --env-file .env ps -q docker)
-            if ($LASTEXITCODE -ne 0) {
-                throw 'Failed to inspect the DinD service.'
-            }
-            $desktopId = $desktopId.Trim()
-            $dockerId = $dockerId.Trim()
-            if ($desktopId -and $dockerId) {
-                $desktopState = (& docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' $desktopId).Trim()
-                $dockerState = (& docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' $dockerId).Trim()
-                if ($desktopState -eq 'healthy' -and $dockerState -eq 'healthy') {
+
+            if (@($containerIds.Values | Where-Object { $_ }).Count -eq $serviceNames.Count) {
+                $serviceStates = [ordered]@{}
+                foreach ($serviceName in $serviceNames) {
+                    $serviceStates[$serviceName] = (& docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' $containerIds[$serviceName]).Trim()
+                }
+                if (@($serviceStates.Values | Where-Object { $_ -ne 'healthy' }).Count -eq 0) {
                     return
                 }
-                if ($desktopState -eq 'unhealthy' -or $dockerState -eq 'unhealthy') {
-                    throw "컨테이너가 unhealthy 상태입니다: desktop=$desktopState, docker=$dockerState"
+                if (@($serviceStates.Values | Where-Object { $_ -eq 'unhealthy' }).Count -gt 0) {
+                    $stateSummary = ($serviceNames | ForEach-Object { "$_=$($serviceStates[$_])" }) -join ', '
+                    Write-EnvironmentServiceLogs -ProjectPath $ProjectPath
+                    throw "컨테이너가 unhealthy 상태입니다: $stateSummary"
                 }
             }
         }
@@ -569,12 +1078,15 @@ function Wait-EnvironmentHealthy {
         }
         Start-Sleep -Seconds 3
     }
+    Write-EnvironmentServiceLogs -ProjectPath $ProjectPath
     throw "환경이 제한 시간 안에 healthy가 되지 않았습니다: $ProjectPath"
 }
 
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    throw 'Docker CLI를 찾을 수 없습니다. Docker Desktop을 먼저 설치하고 실행하십시오.'
+    throw 'Docker CLI를 찾을 수 없습니다. Docker Desktop 또는 Docker Engine 28.0.0 이상을 설치하고 실행하십시오.'
 }
+Assert-DockerEngineVersion
+Assert-DockerComposeVersion
 
 if ([string]::IsNullOrWhiteSpace($RootPath)) {
     $RootPath = $PSScriptRoot
@@ -761,6 +1273,103 @@ if (-not (Test-Cidr $RemoteSubnet)) {
     throw "유효하지 않거나 지나치게 넓은 CIDR입니다: $RemoteSubnet"
 }
 
+if ([string]::IsNullOrWhiteSpace($WireGuardHubEndpoint)) {
+    if ($oldEnvironment.ContainsKey('WIREGUARD_HUB_ENDPOINT') -and
+        -not [string]::IsNullOrWhiteSpace($oldEnvironment['WIREGUARD_HUB_ENDPOINT'])) {
+        $WireGuardHubEndpoint = Read-WithDefault -Prompt 'WireGuard Hub endpoint (IPv4-or-hostname:port)' `
+            -Default $oldEnvironment['WIREGUARD_HUB_ENDPOINT']
+    }
+    else {
+        $WireGuardHubEndpoint = Read-RequiredValue -Prompt 'WireGuard Hub endpoint (IPv4-or-hostname:port)'
+    }
+}
+$WireGuardHubEndpoint = $WireGuardHubEndpoint.Trim()
+if (-not (Test-WireGuardEndpoint $WireGuardHubEndpoint)) {
+    throw "WireGuard Hub endpoint는 IPv4-or-hostname:port 형식이어야 합니다: $WireGuardHubEndpoint"
+}
+
+if ([string]::IsNullOrWhiteSpace($WireGuardHubPublicKey)) {
+    if ($oldEnvironment.ContainsKey('WIREGUARD_HUB_PUBLIC_KEY') -and
+        -not [string]::IsNullOrWhiteSpace($oldEnvironment['WIREGUARD_HUB_PUBLIC_KEY'])) {
+        $WireGuardHubPublicKey = Read-WithDefault -Prompt 'WireGuard Hub public key' `
+            -Default $oldEnvironment['WIREGUARD_HUB_PUBLIC_KEY']
+    }
+    else {
+        $WireGuardHubPublicKey = Read-RequiredValue -Prompt 'WireGuard Hub public key'
+    }
+}
+$WireGuardHubPublicKey = $WireGuardHubPublicKey.Trim()
+if (-not (Test-WireGuardPublicKey $WireGuardHubPublicKey)) {
+    throw 'WireGuard Hub public key는 Base64로 인코딩된 32바이트 키여야 합니다.'
+}
+
+$wireGuardAddressOwners = @(Get-WireGuardAddressOwners `
+    -RootPath $rootFullPath `
+    -ExcludedEnvironmentName $EnvironmentName)
+if ([string]::IsNullOrWhiteSpace($WireGuardAddress)) {
+    if ($oldEnvironment.ContainsKey('WIREGUARD_ADDRESS')) {
+        $defaultWireGuardAddress = $oldEnvironment['WIREGUARD_ADDRESS']
+    }
+    else {
+        $defaultWireGuardAddress = $null
+        $usedWireGuardIps = @($wireGuardAddressOwners | ForEach-Object { $_.Address })
+        for ($hostOctet = 10; $hostOctet -le 254; $hostOctet++) {
+            $candidateIp = "10.200.0.$hostOctet"
+            if ($usedWireGuardIps -notcontains $candidateIp) {
+                $defaultWireGuardAddress = "$candidateIp/24"
+                break
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($defaultWireGuardAddress)) {
+            throw '10.200.0.10/24~10.200.0.254/24 범위에 사용 가능한 WireGuard 주소가 없습니다.'
+        }
+    }
+    $WireGuardAddress = Read-WithDefault -Prompt 'WireGuard IPv4 host CIDR' -Default $defaultWireGuardAddress
+}
+$WireGuardAddress = $WireGuardAddress.Trim()
+if (-not (Test-IPv4HostCidr $WireGuardAddress)) {
+    throw "WireGuard address는 prefix /8~/29 범위의 유효한 IPv4 host CIDR이어야 합니다: $WireGuardAddress"
+}
+$wireGuardCidr = Get-IPv4CidrInfo -Value $WireGuardAddress
+$WireGuardAddress = "$($wireGuardCidr.Address)/$($wireGuardCidr.PrefixLength)"
+$WireGuardIp = $wireGuardCidr.Address
+$WireGuardNetwork = $wireGuardCidr.NetworkCidr
+$duplicateWireGuardOwners = @($wireGuardAddressOwners | Where-Object { $_.Address -eq $WireGuardIp })
+if ($duplicateWireGuardOwners.Count -gt 0) {
+    $duplicateNames = ($duplicateWireGuardOwners | ForEach-Object { $_.EnvironmentName }) -join ', '
+    throw "WireGuard IP $WireGuardIp 는 다른 환경에서 이미 사용 중입니다: $duplicateNames"
+}
+if (Test-IPv4CidrsOverlap -First $WireGuardNetwork -Second $RemoteSubnet) {
+    throw "WireGuard network와 LAN 허용 대역이 겹칩니다: $WireGuardNetwork, $RemoteSubnet"
+}
+
+if (-not $PSBoundParameters.ContainsKey('WireGuardMtu')) {
+    $defaultWireGuardMtu = 1380
+    if ($oldEnvironment.ContainsKey('WIREGUARD_MTU')) {
+        if (-not [int]::TryParse($oldEnvironment['WIREGUARD_MTU'], [ref]$defaultWireGuardMtu)) {
+            throw "기존 WIREGUARD_MTU 값이 올바르지 않습니다: $($oldEnvironment['WIREGUARD_MTU'])"
+        }
+    }
+    $WireGuardMtu = Read-IntegerInRange -Prompt 'WireGuard MTU' -Default $defaultWireGuardMtu -Minimum 1280 -Maximum 1420
+}
+if ($WireGuardMtu -lt 1280 -or $WireGuardMtu -gt 1420) {
+    throw 'WireGuard MTU는 1280 이상 1420 이하여야 합니다.'
+}
+
+if (-not $PSBoundParameters.ContainsKey('WireGuardKeepalive')) {
+    $defaultWireGuardKeepalive = 25
+    if ($oldEnvironment.ContainsKey('WIREGUARD_KEEPALIVE')) {
+        if (-not [int]::TryParse($oldEnvironment['WIREGUARD_KEEPALIVE'], [ref]$defaultWireGuardKeepalive)) {
+            throw "기존 WIREGUARD_KEEPALIVE 값이 올바르지 않습니다: $($oldEnvironment['WIREGUARD_KEEPALIVE'])"
+        }
+    }
+    $WireGuardKeepalive = Read-IntegerInRange -Prompt 'WireGuard persistent keepalive (seconds)' `
+        -Default $defaultWireGuardKeepalive -Minimum 0 -Maximum 65535
+}
+if ($WireGuardKeepalive -lt 0 -or $WireGuardKeepalive -gt 65535) {
+    throw 'WireGuard keepalive는 0 이상 65535 이하여야 합니다.'
+}
+
 if ($SshPort -eq 0) {
     $defaultSshPort = Get-FreeTcpPort -Start 2222 -AllowedExisting $allowedExistingPorts
     $SshPort = [int](Read-WithDefault -Prompt '호스트 SSH 포트' -Default ([string]$defaultSshPort))
@@ -868,14 +1477,47 @@ if ($targetExists -and -not $Replace) {
 $storagePath = Join-Path (Join-Path $rootFullPath 'mount') $EnvironmentName
 $homeStoragePath = Join-Path $storagePath 'home'
 $workspaceStoragePath = Join-Path $storagePath 'workspace'
+$sshPrivateKeyFileName = "${EnvironmentName}_ssh.pem"
+$sshPublicKeyFileName = "${sshPrivateKeyFileName}.pub"
+$targetSshPrivateKeyPath = Join-Path $targetPath $sshPrivateKeyFileName
+$targetSshPublicKeyPath = Join-Path $targetPath $sshPublicKeyFileName
+$wireGuardPublicKeyFileName = "${EnvironmentName}_wireguard_public.key"
+$wireGuardHubPeerFileName = "${EnvironmentName}_hub_peer.conf"
+$targetWireGuardDirectory = Join-Path $targetPath 'wireguard'
+$targetWireGuardPublicKeyPath = Join-Path $targetWireGuardDirectory $wireGuardPublicKeyFileName
+$targetWireGuardHubPeerPath = Join-Path $targetWireGuardDirectory $wireGuardHubPeerFileName
 $backupRoot = Join-Path $rootFullPath '.backup'
 $stagingRoot = Join-Path $rootFullPath '.staging'
 $stagingPath = Join-Path $stagingRoot "$EnvironmentName.$([Guid]::NewGuid().ToString('N'))"
 $storageExistedBefore = Test-Path -LiteralPath $storagePath
 
-$mutex = [Threading.Mutex]::new($false, 'Local\UbuntuDindEnvironmentGenerator')
-if (-not $mutex.WaitOne([TimeSpan]::FromMinutes(10))) {
-    throw '다른 환경 생성 작업이 실행 중입니다.'
+$mutex = $null
+$mutexAcquired = $false
+try {
+    # A Global mutex serializes generators across Windows logon/RDP sessions.
+    # Failing closed on an inaccessible object is safer than using a separate
+    # session-local lock and racing environment names or WireGuard addresses.
+    $mutex = [Threading.Mutex]::new($false, 'Global\DockerVMsUbuntuDindEnvironmentGenerator')
+    try {
+        $mutexAcquired = $mutex.WaitOne([TimeSpan]::FromMinutes(10))
+    }
+    catch [Threading.AbandonedMutexException] {
+        # WaitOne grants ownership when reporting an abandoned mutex.
+        $mutexAcquired = $true
+    }
+    if (-not $mutexAcquired) {
+        throw [TimeoutException]::new('다른 환경 생성 작업이 실행 중입니다.')
+    }
+}
+catch [UnauthorizedAccessException] {
+    if ($null -ne $mutex) { $mutex.Dispose() }
+    $mutex = $null
+    throw '서버 전체 환경 생성 잠금에 접근할 수 없습니다. 동일한 관리자 계정 또는 관리자 권한으로 다시 실행하십시오.'
+}
+catch {
+    if ($null -ne $mutex -and -not $mutexAcquired) { $mutex.Dispose() }
+    $mutex = $null
+    throw
 }
 
 $backupPath = $null
@@ -886,10 +1528,73 @@ $migrationPath = $null
 $completed = $false
 
 try {
+    $wireGuardOwnersAfterLock = @(Get-WireGuardAddressOwners `
+        -RootPath $rootFullPath `
+        -ExcludedEnvironmentName $EnvironmentName)
+    $duplicateAfterLock = @($wireGuardOwnersAfterLock | Where-Object { $_.Address -eq $WireGuardIp })
+    if ($duplicateAfterLock.Count -gt 0) {
+        $duplicateNames = ($duplicateAfterLock | ForEach-Object { $_.EnvironmentName }) -join ', '
+        throw "WireGuard IP $WireGuardIp 가 대기 중 다른 환경에 할당되었습니다: $duplicateNames"
+    }
+
     New-Item -ItemType Directory -Path $stagingPath -Force | Out-Null
+    # Protect the project root itself so another local account with inherited
+    # parent-directory rights cannot replace the PEM key or secret files.
+    Set-SecretAcl -Path $stagingPath
+    New-Item -ItemType Directory -Path $storagePath -Force | Out-Null
+    Set-SecretAcl -Path $storagePath
     New-Item -ItemType Directory -Path $homeStoragePath -Force | Out-Null
     New-Item -ItemType Directory -Path $workspaceStoragePath -Force | Out-Null
+    Set-SecretAcl -Path $homeStoragePath
+    Set-SecretAcl -Path $workspaceStoragePath
     Copy-Item -Path (Join-Path $templatePath '*') -Destination $stagingPath -Recurse -Force
+
+    $wireGuardDirectory = Join-Path $stagingPath 'wireguard'
+    $secretDirectory = Join-Path $stagingPath 'secrets'
+    New-Item -ItemType Directory -Path $wireGuardDirectory -Force | Out-Null
+    New-Item -ItemType Directory -Path $secretDirectory -Force | Out-Null
+    Set-SecretAcl -Path $wireGuardDirectory
+    Set-SecretAcl -Path $secretDirectory
+
+    $stagingSshPrivateKeyPath = Join-Path $stagingPath $sshPrivateKeyFileName
+    $stagingSshPublicKeyPath = Join-Path $stagingPath $sshPublicKeyFileName
+    $existingPrivateKey = Test-Path -LiteralPath $targetSshPrivateKeyPath -PathType Leaf
+    $existingPublicKey = Test-Path -LiteralPath $targetSshPublicKeyPath -PathType Leaf
+    $reusedExistingPrivateKey = $false
+    if ($targetExists -and -not $RotateSshKey -and $existingPrivateKey) {
+        Copy-Item -LiteralPath $targetSshPrivateKeyPath -Destination $stagingSshPrivateKeyPath
+        $reusedExistingPrivateKey = $true
+    }
+    elseif ($targetExists -and -not $RotateSshKey -and $existingPublicKey) {
+        throw "기존 SSH public key만 있고 private key가 없습니다. private key를 복구하거나 -RotateSshKey로 교체하십시오: $targetPath"
+    }
+    else {
+        New-SshPemKeyPair -PrivateKeyPath $stagingSshPrivateKeyPath -Comment "$AccountName@$EnvironmentName"
+    }
+    Set-SecretAcl -Path $stagingSshPrivateKeyPath
+    Write-SshCanonicalPublicKey `
+        -PrivateKeyPath $stagingSshPrivateKeyPath `
+        -PublicKeyPath $stagingSshPublicKeyPath `
+        -Comment "$AccountName@$EnvironmentName"
+    Set-SecretAcl -Path $stagingSshPublicKeyPath
+    try {
+        $sshKeyMetadata = Get-SshKeyPairMetadata `
+            -PrivateKeyPath $stagingSshPrivateKeyPath `
+            -PublicKeyPath $stagingSshPublicKeyPath
+    }
+    catch {
+        if ($reusedExistingPrivateKey) {
+            throw "기존 SSH 키 검증에 실패했습니다. 키를 복구하거나 -RotateSshKey로 교체하십시오. $($_.Exception.Message)"
+        }
+        throw
+    }
+    $sshAuthorizedKeysPath = Join-Path $secretDirectory 'ssh_authorized_keys'
+    [IO.File]::WriteAllText(
+        $sshAuthorizedKeysPath,
+        [IO.File]::ReadAllText($stagingSshPublicKeyPath),
+        [Text.UTF8Encoding]::new($false)
+    )
+    Set-SecretAcl -Path $sshAuthorizedKeysPath
 
     $desktopCpuText = $DesktopCpus.ToString('0.##', [Globalization.CultureInfo]::InvariantCulture)
     $dindCpuText = $DindCpus.ToString('0.##', [Globalization.CultureInfo]::InvariantCulture)
@@ -914,6 +1619,12 @@ try {
         "SSH_PORT=$SshPort",
         "RDP_PORT=$RdpPort",
         "REMOTE_SUBNET=$RemoteSubnet",
+        "WIREGUARD_ADDRESS=$WireGuardAddress",
+        "WIREGUARD_NETWORK=$WireGuardNetwork",
+        "WIREGUARD_HUB_ENDPOINT=$WireGuardHubEndpoint",
+        "WIREGUARD_HUB_PUBLIC_KEY=$WireGuardHubPublicKey",
+        "WIREGUARD_MTU=$WireGuardMtu",
+        "WIREGUARD_KEEPALIVE=$WireGuardKeepalive",
         '# A resource value of -1 means unlimited; the corresponding Compose limit is omitted.',
         "DESKTOP_CPUS=$desktopCpuText",
         "DESKTOP_MEMORY=$DesktopMemory",
@@ -933,9 +1644,7 @@ try {
         [Text.UTF8Encoding]::new($false)
     )
 
-    $secretDirectory = Join-Path $stagingPath 'secrets'
     $secretPath = Join-Path $secretDirectory 'login_password.txt'
-    New-Item -ItemType Directory -Path $secretDirectory -Force | Out-Null
     $passwordText = ConvertFrom-SecureValue $Password
     try {
         [IO.File]::WriteAllText($secretPath, $passwordText, [Text.UTF8Encoding]::new($false))
@@ -952,6 +1661,18 @@ try {
         SSH_PORT = $SshPort
         RDP_PORT = $RdpPort
         REMOTE_SUBNET = $RemoteSubnet
+        WIREGUARD_ADDRESS = $WireGuardAddress
+        WIREGUARD_IP = $WireGuardIp
+        WIREGUARD_NETWORK = $WireGuardNetwork
+        WIREGUARD_HUB_ENDPOINT = $WireGuardHubEndpoint
+        SSH_PRIVATE_KEY = $targetSshPrivateKeyPath
+        SSH_PUBLIC_KEY = $targetSshPublicKeyPath
+        SSH_FINGERPRINT = $sshKeyMetadata.Fingerprint
+        LOCAL_RDP_FILE = "${EnvironmentName}_local.rdp"
+        REMOTE_RDP_FILE = "${EnvironmentName}_remote.rdp"
+        WIREGUARD_PUBLIC_KEY_FILE = "wireguard/${EnvironmentName}_wireguard_public.key"
+        WIREGUARD_HUB_PEER_FILE = "wireguard/${EnvironmentName}_hub_peer.conf"
+        WIREGUARD_STATE_VOLUME = "${EnvironmentName}_wireguard_state"
         STORAGE_ROOT = $storagePath
         HOME_STORAGE = $homeStoragePath
         WORKSPACE_STORAGE = $workspaceStoragePath
@@ -990,12 +1711,22 @@ try {
         Tokens = $tokens
     }
     Expand-TemplateFile @firewallTemplate
-    $rdpTemplate = @{
+    $localRdpTokens = $tokens.Clone()
+    $localRdpTokens['RDP_FULL_ADDRESS'] = "${HostAddress}:$RdpPort"
+    $localRdpTemplate = @{
         Source = Join-Path $stagingPath 'environment_VM.rdp.template'
-        Destination = Join-Path $stagingPath "${EnvironmentName}_VM.rdp"
-        Tokens = $tokens
+        Destination = Join-Path $stagingPath $tokens['LOCAL_RDP_FILE']
+        Tokens = $localRdpTokens
     }
-    Expand-TemplateFile @rdpTemplate
+    Expand-TemplateFile @localRdpTemplate
+    $remoteRdpTokens = $tokens.Clone()
+    $remoteRdpTokens['RDP_FULL_ADDRESS'] = "${WireGuardIp}:3389"
+    $remoteRdpTemplate = @{
+        Source = Join-Path $stagingPath 'environment_VM.rdp.template'
+        Destination = Join-Path $stagingPath $tokens['REMOTE_RDP_FILE']
+        Tokens = $remoteRdpTokens
+    }
+    Expand-TemplateFile @remoteRdpTemplate
     $gpuTestTemplate = @{
         Source = Join-Path $stagingPath 'TestGpu.ps1.template'
         Destination = Join-Path $stagingPath $gpuTestScriptName
@@ -1016,7 +1747,7 @@ try {
     Remove-Item -LiteralPath (Join-Path $stagingPath 'TestGpu.ps1.template')
 
     $manifest = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 3
         generator = 'NewUbuntuDindEnvironment.ps1'
         generatedAt = [DateTime]::UtcNow.ToString('o')
         environmentName = $EnvironmentName
@@ -1027,6 +1758,25 @@ try {
         sshPort = $SshPort
         rdpPort = $RdpPort
         hostPort3389Reserved = $true
+        sshAuthentication = 'publickey-only'
+        sshPrivateKeyPath = $targetSshPrivateKeyPath
+        sshPublicKeyPath = $targetSshPublicKeyPath
+        sshFingerprint = $sshKeyMetadata.Fingerprint
+        localRdpFile = $tokens['LOCAL_RDP_FILE']
+        remoteRdpFile = $tokens['REMOTE_RDP_FILE']
+        wireGuardRequired = $true
+        wireGuardAddress = $WireGuardAddress
+        wireGuardIp = $WireGuardIp
+        wireGuardNetwork = $WireGuardNetwork
+        wireGuardHubEndpoint = $WireGuardHubEndpoint
+        wireGuardHubPublicKey = $WireGuardHubPublicKey
+        wireGuardMtu = $WireGuardMtu
+        wireGuardKeepalive = $WireGuardKeepalive
+        wireGuardPublicKey = $null
+        wireGuardPublicKeyPending = $true
+        wireGuardPublicKeyPath = $targetWireGuardPublicKeyPath
+        wireGuardHubPeerPath = $targetWireGuardHubPeerPath
+        wireGuardStateVolume = $tokens['WIREGUARD_STATE_VOLUME']
         desktopCpus = $DesktopCpus
         desktopCpusUnlimited = $desktopCpuUnlimited
         desktopMemory = $DesktopMemory
@@ -1060,11 +1810,15 @@ try {
         Move-Item -LiteralPath $stagingPath -Destination $targetPath
         $completed = $true
         Write-Host "환경 설정 생성 완료: $targetPath"
+        Write-Host "SSH private key: $targetSshPrivateKeyPath"
+        Write-Host "WireGuard public key와 Hub peer 설정은 첫 'docker compose up -d' 후 다음 명령으로 내보내십시오:"
+        Write-Host "  docker compose --env-file .env cp wireguard:/var/lib/wireguard/public.key `"wireguard/$wireGuardPublicKeyFileName`""
+        Write-Host "  docker compose --env-file .env cp wireguard:/var/lib/wireguard/hub_peer.conf `"wireguard/$wireGuardHubPeerFileName`""
         return
     }
 
     if ($UseBuildKit) {
-        Invoke-Compose -ProjectPath $stagingPath -Arguments @('build', 'desktop', 'docker') -FailureMessage 'Ubuntu 데스크톱/DinD 이미지 빌드에 실패했습니다.'
+        Invoke-Compose -ProjectPath $stagingPath -Arguments @('build', 'desktop', 'docker', 'wireguard') -FailureMessage 'Ubuntu 데스크톱/DinD/WireGuard 이미지 빌드에 실패했습니다.'
     }
     else {
         # Docker Desktop's BuildKit resolves registry metadata even when the
@@ -1093,6 +1847,12 @@ try {
                 '--build-arg', "NVIDIA_CONTAINER_TOOLKIT_VERSION=$NvidiaContainerToolkitVersion",
                 $stagingPath
             ) -FailureMessage 'DinD 엔진 이미지 빌드에 실패했습니다.'
+            Invoke-Docker -Arguments @(
+                'build', '--pull=false',
+                '--tag', "${EnvironmentName}-wireguard:${imageTag}",
+                '--file', (Join-Path $stagingPath 'Dockerfile.wireguard'),
+                $stagingPath
+            ) -FailureMessage 'WireGuard sidecar 이미지 빌드에 실패했습니다.'
         }
         finally {
             if ($null -eq $previousBuildKit) {
@@ -1165,6 +1925,28 @@ try {
     $newStarted = $true
     Wait-EnvironmentHealthy -ProjectPath $targetPath
 
+    Export-WireGuardOutputs `
+        -ProjectPath $targetPath `
+        -PublicKeyDestination $targetWireGuardPublicKeyPath `
+        -HubPeerDestination $targetWireGuardHubPeerPath `
+        -ExpectedWireGuardIp $WireGuardIp `
+        -EnvironmentName $EnvironmentName
+    if (-not (Test-Path -LiteralPath $targetWireGuardPublicKeyPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $targetWireGuardHubPeerPath -PathType Leaf)) {
+        throw "WireGuard public output이 생성되지 않았습니다: $targetWireGuardDirectory"
+    }
+    $wireGuardPublicKey = ([IO.File]::ReadAllText($targetWireGuardPublicKeyPath)).Trim()
+    if (-not (Test-WireGuardPublicKey $wireGuardPublicKey)) {
+        throw "WireGuard sidecar가 잘못된 public key를 생성했습니다: $targetWireGuardPublicKeyPath"
+    }
+    $manifest['wireGuardPublicKey'] = $wireGuardPublicKey
+    $manifest['wireGuardPublicKeyPending'] = $false
+    [IO.File]::WriteAllText(
+        (Join-Path $targetPath '.environment.json'),
+        ($manifest | ConvertTo-Json -Depth 4),
+        [Text.UTF8Encoding]::new($false)
+    )
+
     if ($gpuEnabled) {
         Invoke-Compose -ProjectPath $targetPath `
             -Arguments @('exec', '-T', 'desktop', 'nvidia-smi', '-L') `
@@ -1196,8 +1978,12 @@ CUDA 작업은 우선 데스크톱 컨테이너에서 실행하고, 중첩 CUDA�
     Write-Host "설정: $targetPath"
     Write-Host "영구 홈: $homeStoragePath"
     Write-Host "영구 작업공간: $workspaceStoragePath"
-    Write-Host "SSH: ssh -p $SshPort $AccountName@$HostAddress"
-    Write-Host "RDP: $(Join-Path $targetPath "${EnvironmentName}_VM.rdp")"
+    Write-Host "Local SSH: ssh -o IdentitiesOnly=yes -i `"$targetSshPrivateKeyPath`" -p $SshPort $AccountName@$HostAddress"
+    Write-Host "Remote SSH: ssh -o IdentitiesOnly=yes -i `"$targetSshPrivateKeyPath`" -p 22 $AccountName@$WireGuardIp"
+    Write-Host "Local RDP: $(Join-Path $targetPath $tokens['LOCAL_RDP_FILE'])"
+    Write-Host "Remote RDP: $(Join-Path $targetPath $tokens['REMOTE_RDP_FILE'])"
+    Write-Host "WireGuard public key: $targetWireGuardPublicKeyPath"
+    Write-Host "WireGuard Hub peer: $targetWireGuardHubPeerPath"
     Write-Host "자원: desktop=${desktopCpuDisplay} CPU/$desktopMemoryDisplay, DinD=${dindCpuDisplay} CPU/$dindMemoryDisplay"
     Write-Host "GPU: $gpuDescription"
     if ($null -ne $backupPath) {
@@ -1267,7 +2053,7 @@ finally {
             Remove-Item -LiteralPath $storagePath -Recurse -Force
         }
     }
-    if ($null -ne $mutex) {
+    if ($null -ne $mutex -and $mutexAcquired) {
         try { $mutex.ReleaseMutex() } catch { }
         $mutex.Dispose()
     }

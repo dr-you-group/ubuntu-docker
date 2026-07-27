@@ -17,6 +17,13 @@ HOST_ADDRESS=''
 REMOTE_SUBNET=''
 SSH_PORT='0'
 RDP_PORT='0'
+WIREGUARD_HUB_ENDPOINT=''
+WIREGUARD_HUB_PUBLIC_KEY=''
+WIREGUARD_ADDRESS=''
+WIREGUARD_IP=''
+WIREGUARD_NETWORK=''
+WIREGUARD_MTU=''
+WIREGUARD_KEEPALIVE=''
 DESKTOP_CPUS=''
 DESKTOP_MEMORY=''
 DIND_CPUS=''
@@ -37,6 +44,14 @@ ALLOW_DOCKER_VERSION_CHANGE='0'
 USE_BUILDKIT='0'
 GENERATE_ONLY='0'
 FIREWALL_MODE='ask'
+ROTATE_SSH_KEY='0'
+SSH_KEY_FINGERPRINT=''
+SSH_PRIVATE_KEY_FILE=''
+SSH_PUBLIC_KEY_FILE=''
+DOCKER_COMPOSE_VERSION=''
+DOCKER_COMPOSE_VERSION_ERROR=''
+DOCKER_ENGINE_VERSION=''
+DOCKER_ENGINE_VERSION_ERROR=''
 
 TARGET_PATH=''
 STAGING_PATH=''
@@ -64,6 +79,9 @@ Create an Ubuntu Xfce/RDP/SSH environment with an isolated Docker-in-Docker engi
 Usage:
   new_ubuntu_dind_environment.sh [options]
 
+Requirements:
+  Docker Engine 28.0.0 or newer and Docker Compose 2.33.1 or newer.
+
 Identity and storage:
   --environment, --environment-name NAME
   --account, --account-name NAME
@@ -80,6 +98,15 @@ Network and resources:
   --remote-subnet CIDR
   --ssh-port PORT
   --rdp-port PORT               Must be 3390 or higher; host 3389 is reserved.
+  --wireguard-hub-endpoint HOST:PORT
+                                Public Hub IPv4 literal or DNS hostname and port.
+  --wireguard-hub-public-key KEY
+                                Base64 WireGuard Hub public key.
+  --wireguard-address IPv4/CIDR
+                                Usable host address with a /8 through /29 prefix.
+                                Default: first unused /24 IP from 10.200.0.10.
+  --wireguard-mtu MTU           1280-1420 (default: 1380).
+  --wireguard-keepalive SECONDS 0-65535 (default: 25).
   --desktop-cpus NUMBER|-1      Use -1 for unlimited.
   --desktop-memory SIZE|-1      Example: 4g or 4096m; use -1 for unlimited.
   --dind-cpus NUMBER|-1         Use -1 for unlimited.
@@ -97,6 +124,7 @@ Lifecycle:
   --migrate-legacy-home
   --no-migrate-legacy-home
   --allow-docker-version-change
+  --rotate-ssh-key              Replace the environment's existing SSH client key.
   --generate-only
   --apply-firewall
   --skip-firewall
@@ -140,6 +168,28 @@ read_with_default() {
     read -r -p "${prompt} [${default_value}]: " value
     [[ -n "${value}" ]] || value="${default_value}"
     printf -v "${destination}" '%s' "${value}"
+}
+
+read_required_with_default() {
+    local destination="$1"
+    local prompt="$2"
+    local default_value="$3"
+    local option_name="$4"
+    local value=''
+
+    if ! is_interactive; then
+        [[ -n "${default_value}" ]] ||
+            die "${option_name} is required in non-interactive mode and no existing environment default is available."
+        printf -v "${destination}" '%s' "${default_value}"
+        return 0
+    fi
+    if [[ -n "${default_value}" ]]; then
+        read_with_default "${destination}" "${prompt}" "${default_value}"
+    else
+        read -r -p "${prompt}: " value
+        [[ -n "${value}" ]] || die "${prompt} must not be empty."
+        printf -v "${destination}" '%s' "${value}"
+    fi
 }
 
 read_yes_no() {
@@ -196,6 +246,100 @@ validate_cidr() {
     [[ "${prefix}" =~ ^[0-9]{1,2}$ ]] || return 1
     prefix=$((10#${prefix}))
     (( prefix >= 8 && prefix <= 32 ))
+}
+
+validate_hostname() {
+    local value="${1%.}"
+    local label
+    local -a labels=()
+
+    [[ -n "${value}" && ${#value} -le 253 ]] || return 1
+    [[ "${value}" != *..* ]] || return 1
+    IFS='.' read -r -a labels <<<"${value}"
+    (( ${#labels[@]} > 0 )) || return 1
+    for label in "${labels[@]}"; do
+        (( ${#label} >= 1 && ${#label} <= 63 )) || return 1
+        [[ "${label}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+validate_wireguard_endpoint() {
+    local value="$1"
+    local host port
+
+    if [[ "${value}" =~ ^([^][]+):([0-9]{1,5})$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+        [[ "${host}" != *:* ]] || return 1
+        if [[ "${host}" =~ ^[0-9.]+$ ]]; then
+            validate_ipv4 "${host}" || return 1
+        else
+            validate_hostname "${host}" || return 1
+        fi
+    else
+        return 1
+    fi
+    validate_port_number "${port}"
+}
+
+validate_wireguard_public_key() {
+    local value="$1"
+    local byte_count
+
+    [[ "${value}" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 1
+    [[ "${value}" != 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' ]] || return 1
+    byte_count="$(printf '%s' "${value}" | base64 --decode 2>/dev/null | wc -c)" || return 1
+    byte_count="${byte_count//[[:space:]]/}"
+    [[ "${byte_count}" == 32 ]]
+}
+
+validate_wireguard_address() {
+    local value="$1"
+    local address prefix address_integer mask network broadcast
+
+    [[ "${value}" == */* && "${value}" != */*/* ]] || return 1
+    address="${value%/*}"
+    prefix="${value##*/}"
+    validate_host_ipv4 "${address}" || return 1
+    [[ "${prefix}" =~ ^[0-9]{1,2}$ ]] || return 1
+    prefix=$((10#${prefix}))
+    (( prefix >= 8 && prefix <= 29 )) || return 1
+    address_integer="$(ipv4_to_integer "${address}")"
+    mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    network=$(( address_integer & mask ))
+    broadcast=$(( network | ((~mask) & 0xFFFFFFFF) ))
+    (( address_integer != network && address_integer != broadcast ))
+}
+
+canonicalize_wireguard_address() {
+    local value="$1"
+    local address prefix a b c d
+
+    validate_wireguard_address "${value}" || return 1
+    address="${value%/*}"
+    prefix="${value##*/}"
+    IFS='.' read -r a b c d <<<"${address}"
+    printf '%d.%d.%d.%d/%d\n' \
+        "$((10#${a}))" "$((10#${b}))" "$((10#${c}))" "$((10#${d}))" "$((10#${prefix}))"
+}
+
+cidr_ranges_overlap() {
+    local first="$1"
+    local second="$2"
+    local first_address first_prefix second_address second_prefix
+    local first_mask second_mask first_start first_end second_start second_end
+
+    first_address="${first%/*}"
+    first_prefix=$((10#${first##*/}))
+    second_address="${second%/*}"
+    second_prefix=$((10#${second##*/}))
+    first_mask=$(( (0xFFFFFFFF << (32 - first_prefix)) & 0xFFFFFFFF ))
+    second_mask=$(( (0xFFFFFFFF << (32 - second_prefix)) & 0xFFFFFFFF ))
+    first_start=$(( $(ipv4_to_integer "${first_address}") & first_mask ))
+    second_start=$(( $(ipv4_to_integer "${second_address}") & second_mask ))
+    first_end=$(( first_start | ((~first_mask) & 0xFFFFFFFF) ))
+    second_end=$(( second_start | ((~second_mask) & 0xFFFFFFFF) ))
+    (( first_start <= second_end && second_start <= first_end ))
 }
 
 ipv4_to_integer() {
@@ -271,6 +415,33 @@ read_environment_value() {
             exit
         }
     ' "${file}"
+}
+
+wireguard_ip_in_use() {
+    local wanted_ip="$1"
+    local environment_file address
+
+    while IFS= read -r -d '' environment_file; do
+        [[ "${environment_file}" != "${TARGET_PATH}/.env" ]] || continue
+        address="$(read_environment_value "${environment_file}" WIREGUARD_ADDRESS || true)"
+        validate_wireguard_address "${address}" || continue
+        address="$(canonicalize_wireguard_address "${address}")" || continue
+        [[ "${address%/*}" != "${wanted_ip}" ]] || return 0
+    done < <(find "${ROOT_PATH}" -mindepth 2 -maxdepth 2 -type f -name .env -print0 2>/dev/null)
+    return 1
+}
+
+select_default_wireguard_address() {
+    local final_octet candidate_ip
+
+    for ((final_octet = 10; final_octet <= 254; final_octet += 1)); do
+        candidate_ip="10.200.0.${final_octet}"
+        if ! wireguard_ip_in_use "${candidate_ip}"; then
+            printf '%s/24\n' "${candidate_ip}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 remember_allowed_port() {
@@ -389,6 +560,55 @@ docker_image_exists() {
     docker image inspect "$1" >/dev/null 2>&1
 }
 
+validate_docker_compose_version() {
+    local raw="$1"
+    local major minor patch
+
+    DOCKER_COMPOSE_VERSION=''
+    DOCKER_COMPOSE_VERSION_ERROR=''
+    raw="${raw%$'\r'}"
+    if [[ "${raw}" =~ ^v?((0|[1-9][0-9]*))\.((0|[1-9][0-9]*))\.((0|[1-9][0-9]*))([-+][0-9A-Za-z][0-9A-Za-z.+_-]*)?$ ]]; then
+        major=$((10#${BASH_REMATCH[1]}))
+        minor=$((10#${BASH_REMATCH[3]}))
+        patch=$((10#${BASH_REMATCH[5]}))
+        DOCKER_COMPOSE_VERSION="${major}.${minor}.${patch}"
+    else
+        DOCKER_COMPOSE_VERSION_ERROR="Could not parse Docker Compose version '${raw}'. Expected vMAJOR.MINOR.PATCH with optional trailing metadata; Docker Compose 2.33.1 or newer is required."
+        return 1
+    fi
+
+    if (( major > 2 )) ||
+        (( major == 2 && (minor > 33 || (minor == 33 && patch >= 1)) )); then
+        return 0
+    fi
+    DOCKER_COMPOSE_VERSION_ERROR="Docker Compose 2.33.1 or newer is required for gw_priority; detected ${DOCKER_COMPOSE_VERSION}."
+    return 1
+}
+
+validate_docker_engine_version() {
+    local raw="$1"
+    local major minor patch
+
+    DOCKER_ENGINE_VERSION=''
+    DOCKER_ENGINE_VERSION_ERROR=''
+    raw="${raw%$'\r'}"
+    if [[ "${raw}" =~ ^v?((0|[1-9][0-9]*))\.((0|[1-9][0-9]*))\.((0|[1-9][0-9]*))([-+][0-9A-Za-z][0-9A-Za-z.+_-]*)?$ ]]; then
+        major=$((10#${BASH_REMATCH[1]}))
+        minor=$((10#${BASH_REMATCH[3]}))
+        patch=$((10#${BASH_REMATCH[5]}))
+        DOCKER_ENGINE_VERSION="${major}.${minor}.${patch}"
+    else
+        DOCKER_ENGINE_VERSION_ERROR="Could not parse Docker Engine server version '${raw}'. Expected vMAJOR.MINOR.PATCH with optional trailing metadata; Docker Engine 28.0.0 or newer is required."
+        return 1
+    fi
+
+    if (( major >= 28 )); then
+        return 0
+    fi
+    DOCKER_ENGINE_VERSION_ERROR="Docker Engine 28.0.0 or newer is required for gw_priority Engine API support; detected ${DOCKER_ENGINE_VERSION}."
+    return 1
+}
+
 directory_has_entries() {
     local directory="$1"
     local first
@@ -406,27 +626,89 @@ compose_in() {
     )
 }
 
+export_wireguard_outputs() {
+    local project_path="$1"
+    local output_directory public_output peer_output temporary_directory temporary_public temporary_peer
+    local public_key expected_peer actual_peer
+
+    output_directory="${project_path}/wireguard"
+    public_output="${output_directory}/${ENVIRONMENT_NAME}_wireguard_public.key"
+    peer_output="${output_directory}/${ENVIRONMENT_NAME}_hub_peer.conf"
+    [[ -d "${output_directory}" && ! -L "${output_directory}" ]] ||
+        die "WireGuard output directory is missing or unsafe: ${output_directory}"
+    chmod 0700 "${output_directory}"
+    temporary_directory="$(mktemp -d -- "${output_directory}/.export.XXXXXXXXXX")" ||
+        die "Could not create a temporary WireGuard export directory under ${output_directory}."
+    case "${temporary_directory}" in
+        "${output_directory}/.export."*) ;;
+        *) die "Refusing to use an unexpected WireGuard export directory: ${temporary_directory}" ;;
+    esac
+    temporary_public="${temporary_directory}/public.key"
+    temporary_peer="${temporary_directory}/hub_peer.conf"
+
+    if ! compose_in "${project_path}" cp wireguard:/var/lib/wireguard/public.key "${temporary_public}"; then
+        rm -rf -- "${temporary_directory}"
+        die 'Could not copy the WireGuard public key from its state volume.'
+    fi
+    if [[ ! -f "${temporary_public}" || -L "${temporary_public}" || ! -s "${temporary_public}" ]]; then
+        rm -rf -- "${temporary_directory}"
+        die 'Copied WireGuard public-key output is missing or unsafe.'
+    fi
+    public_key="$(tr -d '\r\n' <"${temporary_public}")"
+    if ! validate_wireguard_public_key "${public_key}"; then
+        rm -rf -- "${temporary_directory}"
+        die 'Copied WireGuard public-key output is invalid.'
+    fi
+    cat >"${temporary_peer}" <<EOF
+# Add this peer to the public WireGuard Hub, then reload the Hub configuration.
+[Peer]
+# DockerVM environment: ${ENVIRONMENT_NAME}
+PublicKey = ${public_key}
+AllowedIPs = ${WIREGUARD_IP}/32
+EOF
+    expected_peer="$(printf '%s\n' \
+        '# Add this peer to the public WireGuard Hub, then reload the Hub configuration.' \
+        '[Peer]' \
+        "# DockerVM environment: ${ENVIRONMENT_NAME}" \
+        "PublicKey = ${public_key}" \
+        "AllowedIPs = ${WIREGUARD_IP}/32")"
+    actual_peer="$(cat "${temporary_peer}")"
+    if [[ "${actual_peer}" != "${expected_peer}" ]]; then
+        rm -rf -- "${temporary_directory}"
+        die 'Generated WireGuard Hub peer output failed exact-content validation.'
+    fi
+    chmod 0644 "${temporary_public}" "${temporary_peer}"
+    mv -f -- "${temporary_public}" "${public_output}"
+    mv -f -- "${temporary_peer}" "${peer_output}"
+    rmdir -- "${temporary_directory}" || die 'Could not remove the empty WireGuard export directory.'
+}
+
 wait_until_healthy() {
     local project_path="$1"
-    local deadline desktop_id docker_id desktop_state docker_state
+    local deadline desktop_id docker_id wireguard_id remote_proxy_id
+    local desktop_state docker_state wireguard_state remote_proxy_state
     deadline=$((SECONDS + 600))
     while (( SECONDS < deadline )); do
         desktop_id="$(compose_in "${project_path}" ps -q desktop 2>/dev/null || true)"
         docker_id="$(compose_in "${project_path}" ps -q docker 2>/dev/null || true)"
-        if [[ -n "${desktop_id}" && -n "${docker_id}" ]]; then
+        wireguard_id="$(compose_in "${project_path}" ps -q wireguard 2>/dev/null || true)"
+        remote_proxy_id="$(compose_in "${project_path}" ps -q remote_proxy 2>/dev/null || true)"
+        if [[ -n "${desktop_id}" && -n "${docker_id}" && -n "${wireguard_id}" && -n "${remote_proxy_id}" ]]; then
             desktop_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${desktop_id}" 2>/dev/null || true)"
             docker_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${docker_id}" 2>/dev/null || true)"
-            if [[ "${desktop_state}" == healthy && "${docker_state}" == healthy ]]; then
+            wireguard_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${wireguard_id}" 2>/dev/null || true)"
+            remote_proxy_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${remote_proxy_id}" 2>/dev/null || true)"
+            if [[ "${desktop_state}" == healthy && "${docker_state}" == healthy && "${wireguard_state}" == healthy && "${remote_proxy_state}" == healthy ]]; then
                 return 0
             fi
-            if [[ "${desktop_state}" == unhealthy || "${docker_state}" == unhealthy ]]; then
-                compose_in "${project_path}" logs --tail 100 desktop docker >&2 || true
-                die "Environment became unhealthy: desktop=${desktop_state}, docker=${docker_state}."
+            if [[ "${desktop_state}" == unhealthy || "${docker_state}" == unhealthy || "${wireguard_state}" == unhealthy || "${remote_proxy_state}" == unhealthy ]]; then
+                compose_in "${project_path}" logs --tail 100 desktop docker wireguard remote_proxy >&2 || true
+                die "Environment became unhealthy: desktop=${desktop_state}, docker=${docker_state}, wireguard=${wireguard_state}, remote_proxy=${remote_proxy_state}."
             fi
         fi
         sleep 3
     done
-    compose_in "${project_path}" logs --tail 100 desktop docker >&2 || true
+    compose_in "${project_path}" logs --tail 100 desktop docker wireguard remote_proxy >&2 || true
     die "Environment did not become healthy within 600 seconds: ${project_path}"
 }
 
@@ -638,6 +920,97 @@ random_suffix() {
     fi
 }
 
+derive_ssh_public_key() {
+    local private_key="$1"
+    ssh-keygen -y -P '' -f "${private_key}" 2>/dev/null
+}
+
+validate_ssh_private_key() {
+    local private_key="$1"
+    local first_line public_key details
+
+    [[ -f "${private_key}" && ! -L "${private_key}" && -s "${private_key}" ]] || return 1
+    IFS= read -r first_line <"${private_key}" || return 1
+    [[ "${first_line}" == '-----BEGIN RSA PRIVATE KEY-----' ]] || return 1
+    public_key="$(derive_ssh_public_key "${private_key}")" || return 1
+    [[ "${public_key}" == ssh-rsa\ * ]] || return 1
+    details="$(printf '%s\n' "${public_key}" | ssh-keygen -l -E sha256 -f - 2>/dev/null)" || return 1
+    [[ "${details}" == 4096\ * && "${details}" == *'(RSA)' ]]
+}
+
+validate_matching_ssh_public_key() {
+    local private_key="$1"
+    local public_key_file="$2"
+    local derived stored nonempty_lines
+
+    [[ -f "${public_key_file}" && ! -L "${public_key_file}" && -s "${public_key_file}" ]] || return 1
+    nonempty_lines="$(awk 'NF { count += 1 } END { print count + 0 }' "${public_key_file}")"
+    [[ "${nonempty_lines}" == 1 ]] || return 1
+    derived="$(derive_ssh_public_key "${private_key}")" || return 1
+    stored="$(awk 'NF { print $1 " " $2; exit }' "${public_key_file}")"
+    [[ "${stored}" == "${derived}" ]]
+}
+
+write_ssh_public_key() {
+    local private_key="$1"
+    local public_key_file="$2"
+    local public_key
+
+    public_key="$(derive_ssh_public_key "${private_key}")" ||
+        die "Could not derive the public key from ${private_key}."
+    printf '%s %s@%s\n' "${public_key}" "${ACCOUNT_NAME}" "${ENVIRONMENT_NAME}" >"${public_key_file}"
+    chmod 0644 "${public_key_file}"
+}
+
+prepare_ssh_identity() {
+    local old_private old_public staged_private staged_public generated_public fingerprint_details
+    local reuse_existing='0'
+
+    SSH_PRIVATE_KEY_FILE="${ENVIRONMENT_NAME}_ssh.pem"
+    SSH_PUBLIC_KEY_FILE="${ENVIRONMENT_NAME}_ssh.pub"
+    old_private="${TARGET_PATH}/${SSH_PRIVATE_KEY_FILE}"
+    old_public="${TARGET_PATH}/${SSH_PUBLIC_KEY_FILE}"
+    staged_private="${STAGING_PATH}/${SSH_PRIVATE_KEY_FILE}"
+    staged_public="${STAGING_PATH}/${SSH_PUBLIC_KEY_FILE}"
+    mkdir -p -- "${STAGING_PATH}/secrets"
+
+    if [[ "${ROTATE_SSH_KEY}" != 1 && -e "${old_private}" ]]; then
+        validate_ssh_private_key "${old_private}" ||
+            die "Existing SSH private key is not an unencrypted RSA-4096 PEM key; use --rotate-ssh-key to replace it: ${old_private}"
+        if [[ -e "${old_public}" ]]; then
+            validate_matching_ssh_public_key "${old_private}" "${old_public}" ||
+                die "Existing SSH public key does not match its private key; use --rotate-ssh-key to replace the pair: ${old_public}"
+        fi
+        install -m 0600 -- "${old_private}" "${staged_private}"
+        reuse_existing='1'
+    elif [[ "${ROTATE_SSH_KEY}" != 1 && -e "${old_public}" ]]; then
+        die "Existing SSH public key has no reusable private key; use --rotate-ssh-key to replace the pair: ${old_public}"
+    fi
+
+    if [[ "${reuse_existing}" != 1 ]]; then
+        [[ ! -e "${staged_private}" && ! -e "${staged_private}.pub" && ! -e "${staged_public}" ]] ||
+            die "Refusing to overwrite an unexpected staged SSH key: ${staged_private}"
+        ssh-keygen -q -t rsa -b 4096 -m PEM -N '' \
+            -C "${ACCOUNT_NAME}@${ENVIRONMENT_NAME}" -f "${staged_private}"
+        generated_public="${staged_private}.pub"
+        [[ -f "${generated_public}" ]] || die 'ssh-keygen did not create the expected public key.'
+        rm -f -- "${generated_public}"
+    fi
+
+    validate_ssh_private_key "${staged_private}" ||
+        die "Generated or reused SSH private key failed validation: ${staged_private}"
+    chmod 0600 "${staged_private}"
+    write_ssh_public_key "${staged_private}" "${staged_public}"
+    validate_matching_ssh_public_key "${staged_private}" "${staged_public}" ||
+        die 'Generated SSH public key does not match the private key.'
+    install -m 0600 -- "${staged_public}" "${STAGING_PATH}/secrets/ssh_authorized_keys"
+
+    fingerprint_details="$(ssh-keygen -l -E sha256 -f "${staged_public}" 2>/dev/null)" ||
+        die 'Could not calculate the SSH public-key fingerprint.'
+    SSH_KEY_FINGERPRINT="$(awk '{ print $2; exit }' <<<"${fingerprint_details}")"
+    [[ "${SSH_KEY_FINGERPRINT}" == SHA256:* ]] || die 'Unexpected SSH public-key fingerprint format.'
+}
+
 parse_arguments() {
     while (( $# > 0 )); do
         case "$1" in
@@ -666,6 +1039,21 @@ parse_arguments() {
             --rdp-port)
                 require_option_value "$1" "$#"; RDP_PORT="$2"; shift 2 ;;
             --rdp-port=*) RDP_PORT="${1#*=}"; shift ;;
+            --wireguard-hub-endpoint)
+                require_option_value "$1" "$#"; WIREGUARD_HUB_ENDPOINT="$2"; shift 2 ;;
+            --wireguard-hub-endpoint=*) WIREGUARD_HUB_ENDPOINT="${1#*=}"; shift ;;
+            --wireguard-hub-public-key)
+                require_option_value "$1" "$#"; WIREGUARD_HUB_PUBLIC_KEY="$2"; shift 2 ;;
+            --wireguard-hub-public-key=*) WIREGUARD_HUB_PUBLIC_KEY="${1#*=}"; shift ;;
+            --wireguard-address)
+                require_option_value "$1" "$#"; WIREGUARD_ADDRESS="$2"; shift 2 ;;
+            --wireguard-address=*) WIREGUARD_ADDRESS="${1#*=}"; shift ;;
+            --wireguard-mtu)
+                require_option_value "$1" "$#"; WIREGUARD_MTU="$2"; shift 2 ;;
+            --wireguard-mtu=*) WIREGUARD_MTU="${1#*=}"; shift ;;
+            --wireguard-keepalive)
+                require_option_value "$1" "$#"; WIREGUARD_KEEPALIVE="$2"; shift 2 ;;
+            --wireguard-keepalive=*) WIREGUARD_KEEPALIVE="${1#*=}"; shift ;;
             --desktop-cpus)
                 require_option_value "$1" "$#"; DESKTOP_CPUS="$2"; shift 2 ;;
             --desktop-cpus=*) DESKTOP_CPUS="${1#*=}"; shift ;;
@@ -703,6 +1091,7 @@ parse_arguments() {
             --migrate-legacy-home) MIGRATE_LEGACY_HOME='yes'; shift ;;
             --no-migrate-legacy-home) MIGRATE_LEGACY_HOME='no'; shift ;;
             --allow-docker-version-change) ALLOW_DOCKER_VERSION_CHANGE='1'; shift ;;
+            --rotate-ssh-key) ROTATE_SSH_KEY='1'; shift ;;
             --use-buildkit) USE_BUILDKIT='1'; shift ;;
             --generate-only) GENERATE_ONLY='1'; shift ;;
             --apply-firewall) FIREWALL_MODE='apply'; shift ;;
@@ -807,6 +1196,61 @@ prepare_inputs() {
     fi
     [[ -n "${REMOTE_SUBNET}" ]] || read_with_default REMOTE_SUBNET 'Allowed remote CIDR' "${default_value}"
     validate_cidr "${REMOTE_SUBNET}" || die "Invalid or overly broad CIDR: ${REMOTE_SUBNET}"
+
+    old_value="$(read_environment_value "${old_env}" WIREGUARD_HUB_ENDPOINT || true)"
+    if [[ -z "${WIREGUARD_HUB_ENDPOINT}" ]]; then
+        read_required_with_default WIREGUARD_HUB_ENDPOINT 'Public WireGuard Hub endpoint (IPv4-or-hostname:port)' "${old_value}" '--wireguard-hub-endpoint'
+    fi
+    validate_no_line_breaks 'WireGuard Hub endpoint' "${WIREGUARD_HUB_ENDPOINT}"
+    validate_wireguard_endpoint "${WIREGUARD_HUB_ENDPOINT}" ||
+        die 'WireGuard Hub endpoint must use valid IPv4-or-hostname:port syntax; IPv6 literals are not supported.'
+
+    old_value="$(read_environment_value "${old_env}" WIREGUARD_HUB_PUBLIC_KEY || true)"
+    if [[ -z "${WIREGUARD_HUB_PUBLIC_KEY}" ]]; then
+        read_required_with_default WIREGUARD_HUB_PUBLIC_KEY 'WireGuard Hub public key' "${old_value}" '--wireguard-hub-public-key'
+    fi
+    validate_no_line_breaks 'WireGuard Hub public key' "${WIREGUARD_HUB_PUBLIC_KEY}"
+    validate_wireguard_public_key "${WIREGUARD_HUB_PUBLIC_KEY}" ||
+        die 'WireGuard Hub public key must be a valid, non-zero base64-encoded 32-byte key.'
+
+    old_value="$(read_environment_value "${old_env}" WIREGUARD_ADDRESS || true)"
+    if [[ -z "${WIREGUARD_ADDRESS}" ]]; then
+        if [[ -n "${old_value}" ]]; then
+            default_value="${old_value}"
+        else
+            default_value="$(select_default_wireguard_address)" ||
+                die 'No unused default WireGuard address remains in 10.200.0.10-10.200.0.254.'
+        fi
+        read_with_default WIREGUARD_ADDRESS 'WireGuard environment IPv4/CIDR' "${default_value}"
+    fi
+    validate_wireguard_address "${WIREGUARD_ADDRESS}" ||
+        die 'WireGuard address must be a usable IPv4 host address with a /8 through /29 prefix.'
+    WIREGUARD_ADDRESS="$(canonicalize_wireguard_address "${WIREGUARD_ADDRESS}")" ||
+        die 'Could not canonicalize the validated WireGuard address.'
+    WIREGUARD_IP="${WIREGUARD_ADDRESS%/*}"
+    if wireguard_ip_in_use "${WIREGUARD_IP}"; then
+        die "WireGuard IP ${WIREGUARD_IP} is already assigned to another environment under ${ROOT_PATH}."
+    fi
+    WIREGUARD_NETWORK="$(network_cidr "${WIREGUARD_IP}" "$((10#${WIREGUARD_ADDRESS##*/}))")"
+    if cidr_ranges_overlap "${REMOTE_SUBNET}" "${WIREGUARD_NETWORK}"; then
+        die "WireGuard network ${WIREGUARD_NETWORK} overlaps the LAN remote subnet ${REMOTE_SUBNET}."
+    fi
+
+    old_value="$(read_environment_value "${old_env}" WIREGUARD_MTU || true)"
+    default_value="${old_value:-1380}"
+    [[ -n "${WIREGUARD_MTU}" ]] || read_with_default WIREGUARD_MTU 'WireGuard MTU' "${default_value}"
+    [[ "${WIREGUARD_MTU}" =~ ^[0-9]{1,5}$ ]] || die 'WireGuard MTU must be an integer from 1280 through 1420.'
+    WIREGUARD_MTU=$((10#${WIREGUARD_MTU}))
+    (( WIREGUARD_MTU >= 1280 && WIREGUARD_MTU <= 1420 )) ||
+        die 'WireGuard MTU must be an integer from 1280 through 1420.'
+
+    old_value="$(read_environment_value "${old_env}" WIREGUARD_KEEPALIVE || true)"
+    default_value="${old_value:-25}"
+    [[ -n "${WIREGUARD_KEEPALIVE}" ]] || read_with_default WIREGUARD_KEEPALIVE 'WireGuard persistent keepalive seconds' "${default_value}"
+    [[ "${WIREGUARD_KEEPALIVE}" =~ ^[0-9]{1,5}$ ]] || die 'WireGuard keepalive must be an integer from 0 through 65535.'
+    WIREGUARD_KEEPALIVE=$((10#${WIREGUARD_KEEPALIVE}))
+    (( WIREGUARD_KEEPALIVE >= 0 && WIREGUARD_KEEPALIVE <= 65535 )) ||
+        die 'WireGuard keepalive must be an integer from 0 through 65535.'
 
     collect_existing_environment_ports "${old_env}"
     if [[ "${SSH_PORT}" == 0 ]]; then
@@ -955,6 +1399,7 @@ write_environment_files() {
     local desktop_cpu_limit desktop_memory_limit dind_cpu_limit dind_memory_limit
     local desktop_cpu_display desktop_memory_display dind_cpu_display dind_memory_display
     local desktop_cpus_unlimited desktop_memory_unlimited dind_cpus_unlimited dind_memory_unlimited
+    local local_rdp_file remote_rdp_file wireguard_public_key_file wireguard_hub_peer_file wireguard_state_volume
     image_tag="26.04-$(date -u +%Y%m%d%H%M%S)-$(random_suffix)"
     storage_env="$(env_single_quoted "${STORAGE_PATH}")"
     chain_prefix="${ENVIRONMENT_NAME//-/_}"
@@ -963,6 +1408,11 @@ write_environment_files() {
     firewall_chain="DVM_${chain_prefix}_${chain_hash}"
     firewall_chain="${firewall_chain:0:25}"
     firewall_script="${TARGET_PATH}/configure_${ENVIRONMENT_NAME_SNAKE}_firewall.sh"
+    local_rdp_file="${ENVIRONMENT_NAME}_local.rdp"
+    remote_rdp_file="${ENVIRONMENT_NAME}_remote.rdp"
+    wireguard_public_key_file="wireguard/${ENVIRONMENT_NAME}_wireguard_public.key"
+    wireguard_hub_peer_file="wireguard/${ENVIRONMENT_NAME}_hub_peer.conf"
+    wireguard_state_volume="${ENVIRONMENT_NAME}_wireguard_state"
     gpu_status='disabled'
     gpu_test_command='./test_gpu.sh'
     if [[ "${GPU_ENABLED}" == 1 ]]; then
@@ -1008,6 +1458,12 @@ HOST_ADDRESS=${HOST_ADDRESS}
 SSH_PORT=${SSH_PORT}
 RDP_PORT=${RDP_PORT}
 REMOTE_SUBNET=${REMOTE_SUBNET}
+WIREGUARD_HUB_ENDPOINT=${WIREGUARD_HUB_ENDPOINT}
+WIREGUARD_HUB_PUBLIC_KEY=${WIREGUARD_HUB_PUBLIC_KEY}
+WIREGUARD_ADDRESS=${WIREGUARD_ADDRESS}
+WIREGUARD_NETWORK=${WIREGUARD_NETWORK}
+WIREGUARD_MTU=${WIREGUARD_MTU}
+WIREGUARD_KEEPALIVE=${WIREGUARD_KEEPALIVE}
 # A resource value of -1 means unlimited; the corresponding Compose limit is omitted.
 DESKTOP_CPUS=${DESKTOP_CPUS}
 DESKTOP_MEMORY=${DESKTOP_MEMORY}
@@ -1025,6 +1481,8 @@ EOF
     chmod 0600 "${STAGING_PATH}/.env"
 
     mkdir -p -- "${STAGING_PATH}/secrets"
+    [[ -s "${STAGING_PATH}/secrets/ssh_authorized_keys" ]] ||
+        die 'The staged SSH authorized-keys secret is missing.'
     printf '%s' "${PASSWORD_VALUE}" >"${STAGING_PATH}/secrets/login_password.txt"
     chmod 0600 "${STAGING_PATH}/secrets/login_password.txt"
     PASSWORD_VALUE=''
@@ -1035,7 +1493,23 @@ EOF
         [HOST_ADDRESS]="${HOST_ADDRESS}"
         [SSH_PORT]="${SSH_PORT}"
         [RDP_PORT]="${RDP_PORT}"
+        [RDP_FULL_ADDRESS]="${HOST_ADDRESS}:${RDP_PORT}"
+        [LOCAL_RDP_FILE]="${local_rdp_file}"
+        [REMOTE_RDP_FILE]="${remote_rdp_file}"
         [REMOTE_SUBNET]="${REMOTE_SUBNET}"
+        [WIREGUARD_HUB_ENDPOINT]="${WIREGUARD_HUB_ENDPOINT}"
+        [WIREGUARD_HUB_PUBLIC_KEY]="${WIREGUARD_HUB_PUBLIC_KEY}"
+        [WIREGUARD_ADDRESS]="${WIREGUARD_ADDRESS}"
+        [WIREGUARD_IP]="${WIREGUARD_IP}"
+        [WIREGUARD_NETWORK]="${WIREGUARD_NETWORK}"
+        [WIREGUARD_MTU]="${WIREGUARD_MTU}"
+        [WIREGUARD_KEEPALIVE]="${WIREGUARD_KEEPALIVE}"
+        [WIREGUARD_PUBLIC_KEY_FILE]="${wireguard_public_key_file}"
+        [WIREGUARD_HUB_PEER_FILE]="${wireguard_hub_peer_file}"
+        [WIREGUARD_STATE_VOLUME]="${wireguard_state_volume}"
+        [SSH_PRIVATE_KEY]="${SSH_PRIVATE_KEY_FILE}"
+        [SSH_PUBLIC_KEY]="${SSH_PUBLIC_KEY_FILE}"
+        [SSH_FINGERPRINT]="${SSH_KEY_FINGERPRINT}"
         [STORAGE_ROOT]="${STORAGE_PATH}"
         [HOME_STORAGE]="${HOME_STORAGE_PATH}"
         [WORKSPACE_STORAGE]="${WORKSPACE_STORAGE_PATH}"
@@ -1060,7 +1534,10 @@ EOF
     expand_template "${STAGING_PATH}/compose.yaml.template" "${STAGING_PATH}/compose.yaml"
     chmod 0644 "${STAGING_PATH}/compose.yaml"
     expand_template "${STAGING_PATH}/README.md.template" "${STAGING_PATH}/README.md"
-    expand_template "${STAGING_PATH}/environment_VM.rdp.template" "${STAGING_PATH}/${ENVIRONMENT_NAME}_VM.rdp"
+    expand_template "${STAGING_PATH}/environment_VM.rdp.template" "${STAGING_PATH}/${local_rdp_file}"
+    TEMPLATE_TOKENS[RDP_FULL_ADDRESS]="${WIREGUARD_IP}:3389"
+    expand_template "${STAGING_PATH}/environment_VM.rdp.template" "${STAGING_PATH}/${remote_rdp_file}"
+    TEMPLATE_TOKENS[RDP_FULL_ADDRESS]="${HOST_ADDRESS}:${RDP_PORT}"
     expand_template "${STAGING_PATH}/configure_firewall.sh.template" "${STAGING_PATH}/configure_${ENVIRONMENT_NAME_SNAKE}_firewall.sh"
     chmod 0755 "${STAGING_PATH}/configure_${ENVIRONMENT_NAME_SNAKE}_firewall.sh"
 
@@ -1082,7 +1559,7 @@ EOF
 
     cat >"${STAGING_PATH}/.environment.json" <<EOF
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "generator": "${SCRIPT_NAME}",
   "generatedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "hostOs": "linux",
@@ -1096,7 +1573,25 @@ EOF
   "remoteSubnet": "${REMOTE_SUBNET}",
   "sshPort": ${SSH_PORT},
   "rdpPort": ${RDP_PORT},
+  "sshAuthentication": "key-only",
+  "sshPrivateKeyFile": "$(json_escape "${SSH_PRIVATE_KEY_FILE}")",
+  "sshPublicKeyFile": "$(json_escape "${SSH_PUBLIC_KEY_FILE}")",
+  "sshKeyFingerprint": "$(json_escape "${SSH_KEY_FINGERPRINT}")",
+  "localRdpFile": "$(json_escape "${local_rdp_file}")",
+  "remoteRdpFile": "$(json_escape "${remote_rdp_file}")",
   "hostPort3389Reserved": true,
+  "wireguardRequired": true,
+  "wireguardAddress": "${WIREGUARD_ADDRESS}",
+  "wireguardIp": "${WIREGUARD_IP}",
+  "wireguardNetwork": "${WIREGUARD_NETWORK}",
+  "wireguardHubEndpoint": "$(json_escape "${WIREGUARD_HUB_ENDPOINT}")",
+  "wireguardHubPublicKey": "${WIREGUARD_HUB_PUBLIC_KEY}",
+  "wireguardMtu": ${WIREGUARD_MTU},
+  "wireguardKeepalive": ${WIREGUARD_KEEPALIVE},
+  "wireguardPublicKeyFile": "${wireguard_public_key_file}",
+  "wireguardHubPeerFile": "${wireguard_hub_peer_file}",
+  "wireguardStateVolume": "${wireguard_state_volume}",
+  "wireguardKeyGeneratedOnFirstStart": true,
   "desktopCpus": ${DESKTOP_CPUS},
   "desktopCpusUnlimited": ${desktop_cpus_unlimited},
   "desktopMemory": "${DESKTOP_MEMORY}",
@@ -1113,7 +1608,8 @@ EOF
   "nvidiaContainerToolkitVersion": "$(json_escape "${NVIDIA_CONTAINER_TOOLKIT_VERSION}")"
 }
 EOF
-    chmod 0644 "${STAGING_PATH}/.environment.json" "${STAGING_PATH}/README.md"
+    chmod 0644 "${STAGING_PATH}/.environment.json" "${STAGING_PATH}/README.md" \
+        "${STAGING_PATH}/${local_rdp_file}" "${STAGING_PATH}/${remote_rdp_file}"
 }
 
 decide_legacy_migration() {
@@ -1159,31 +1655,36 @@ perform_legacy_migration() {
 }
 
 build_images() {
-    info 'Building desktop and DinD images ...'
+    info 'Building desktop, DinD, and WireGuard images ...'
     if [[ "${USE_BUILDKIT}" == 1 ]]; then
         (
             export DOCKER_BUILDKIT=1
             export COMPOSE_DOCKER_CLI_BUILD=1
-            compose_in "${STAGING_PATH}" build desktop docker
+            compose_in "${STAGING_PATH}" build desktop docker wireguard
         )
     else
-        compose_in "${STAGING_PATH}" build desktop docker
+        compose_in "${STAGING_PATH}" build desktop docker wireguard
     fi
 }
 
 main() {
-    local old_env lock_path timestamp firewall_script
+    local old_env lock_path timestamp firewall_script compose_version_output engine_version_output
 
     parse_arguments "$@"
 
-    for command_name in docker flock ip ss awk grep find stat realpath tar cksum nproc; do
+    for command_name in docker flock ip ss awk grep find stat realpath tar cksum nproc base64 wc tr ssh-keygen install mktemp; do
         command -v "${command_name}" >/dev/null 2>&1 || die "Required command is missing: ${command_name}"
     done
     docker info >/dev/null 2>&1 || die 'Docker Engine is unavailable or the current user cannot access it.'
+    engine_version_output="$(docker version --format '{{.Server.Version}}' 2>/dev/null)" ||
+        die 'Unable to query the Docker Engine server version; Docker Engine 28.0.0 or newer is required.'
+    validate_docker_engine_version "${engine_version_output}" || die "${DOCKER_ENGINE_VERSION_ERROR}"
     if docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q 'rootless'; then
         die 'Rootless Docker is not supported because the isolated DinD service requires privileged mode and overlay2.'
     fi
-    docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is required.'
+    compose_version_output="$(docker compose version --short 2>/dev/null)" ||
+        die 'Unable to query Docker Compose with version --short; Docker Compose 2.33.1 or newer is required.'
+    validate_docker_compose_version "${compose_version_output}" || die "${DOCKER_COMPOSE_VERSION_ERROR}"
 
     ROOT_PATH="$(realpath -m -- "${ROOT_PATH}")"
     validate_no_line_breaks 'Root path' "${ROOT_PATH}"
@@ -1229,6 +1730,8 @@ main() {
     STAGING_PATH="${ROOT_PATH}/.staging/${ENVIRONMENT_NAME}.$(random_suffix)"
     mkdir -p -- "${STAGING_PATH}"
     cp -a -- "${TEMPLATE_PATH}/." "${STAGING_PATH}/"
+    install -d -m 0700 "${STAGING_PATH}/wireguard"
+    prepare_ssh_identity
     write_environment_files
 
     compose_in "${STAGING_PATH}" config --quiet
@@ -1239,6 +1742,17 @@ main() {
         SWAPPED='1'
         COMPLETED='1'
         info "Environment configuration generated: ${TARGET_PATH}"
+        info "SSH private key: ${TARGET_PATH}/${SSH_PRIVATE_KEY_FILE}"
+        info "SSH public key: ${TARGET_PATH}/${SSH_PUBLIC_KEY_FILE} (${SSH_KEY_FINGERPRINT})"
+        info "Local SSH after startup: ssh -o IdentitiesOnly=yes -i $(single_quote_shell_value "${TARGET_PATH}/${SSH_PRIVATE_KEY_FILE}") -p ${SSH_PORT} ${ACCOUNT_NAME}@${HOST_ADDRESS}"
+        info "Remote SSH after Hub registration: ssh -o IdentitiesOnly=yes -i $(single_quote_shell_value "${TARGET_PATH}/${SSH_PRIVATE_KEY_FILE}") ${ACCOUNT_NAME}@${WIREGUARD_IP}"
+        info "Local RDP file: ${TARGET_PATH}/${ENVIRONMENT_NAME}_local.rdp"
+        info "Remote RDP file: ${TARGET_PATH}/${ENVIRONMENT_NAME}_remote.rdp"
+        info 'The WireGuard public key and Hub peer snippet are generated on the first Compose start.'
+        info "Start command: cd $(single_quote_shell_value "${TARGET_PATH}") && docker compose --env-file .env up -d --build"
+        info "Copy public key: docker compose --env-file .env cp wireguard:/var/lib/wireguard/public.key wireguard/${ENVIRONMENT_NAME}_wireguard_public.key"
+        info "Copy Hub peer: docker compose --env-file .env cp wireguard:/var/lib/wireguard/hub_peer.conf wireguard/${ENVIRONMENT_NAME}_hub_peer.conf"
+        info "Expected Hub peer file: ${TARGET_PATH}/wireguard/${ENVIRONMENT_NAME}_hub_peer.conf"
         return 0
     fi
 
@@ -1276,6 +1790,7 @@ main() {
     compose_in "${TARGET_PATH}" up -d
     NEW_STARTED='1'
     wait_until_healthy "${TARGET_PATH}"
+    export_wireguard_outputs "${TARGET_PATH}"
 
     if [[ "${GPU_ENABLED}" == 1 ]]; then
         info 'Running direct and nested GPU verification ...'
@@ -1288,8 +1803,14 @@ main() {
     info "Configuration: ${TARGET_PATH}"
     info "Persistent home: ${HOME_STORAGE_PATH}"
     info "Persistent workspace: ${WORKSPACE_STORAGE_PATH}"
-    info "SSH: ssh -p ${SSH_PORT} ${ACCOUNT_NAME}@${HOST_ADDRESS}"
-    info "RDP file: ${TARGET_PATH}/${ENVIRONMENT_NAME}_VM.rdp"
+    info "Local SSH: ssh -o IdentitiesOnly=yes -i $(single_quote_shell_value "${TARGET_PATH}/${SSH_PRIVATE_KEY_FILE}") -p ${SSH_PORT} ${ACCOUNT_NAME}@${HOST_ADDRESS}"
+    info "Remote SSH: ssh -o IdentitiesOnly=yes -i $(single_quote_shell_value "${TARGET_PATH}/${SSH_PRIVATE_KEY_FILE}") ${ACCOUNT_NAME}@${WIREGUARD_IP}"
+    info "SSH public key: ${TARGET_PATH}/${SSH_PUBLIC_KEY_FILE} (${SSH_KEY_FINGERPRINT})"
+    info "Local RDP file: ${TARGET_PATH}/${ENVIRONMENT_NAME}_local.rdp"
+    info "Remote RDP file: ${TARGET_PATH}/${ENVIRONMENT_NAME}_remote.rdp"
+    info "WireGuard: ${WIREGUARD_ADDRESS} via ${WIREGUARD_HUB_ENDPOINT}"
+    info "WireGuard public key: ${TARGET_PATH}/wireguard/${ENVIRONMENT_NAME}_wireguard_public.key"
+    info "Hub peer config: ${TARGET_PATH}/wireguard/${ENVIRONMENT_NAME}_hub_peer.conf"
     info "Resources: desktop=$(resource_display_value "${DESKTOP_CPUS}") CPU/$(resource_display_value "${DESKTOP_MEMORY}"), DinD=$(resource_display_value "${DIND_CPUS}") CPU/$(resource_display_value "${DIND_MEMORY}")"
     info "GPU: $([[ "${GPU_ENABLED}" == 1 ]] && printf 'enabled (%s)' "${CUDA_IMAGE}" || printf 'disabled')"
     [[ -z "${BACKUP_PATH}" ]] || info "Previous configuration backup: ${BACKUP_PATH}"

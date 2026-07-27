@@ -1,2 +1,6 @@
 .env
 secrets/
+*.pem
+*.pem.pub
+*.rdp
+wireguard/

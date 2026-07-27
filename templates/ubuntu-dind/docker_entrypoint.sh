@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 readonly account_name="${ACCOUNT_NAME:?ACCOUNT_NAME is required}"
 readonly password_file="${ACCOUNT_PASSWORD_FILE:-/run/secrets/login_password}"
+readonly authorized_keys_file="${ACCOUNT_AUTHORIZED_KEYS_FILE:-/run/secrets/ssh_authorized_keys}"
 readonly account_home="/home/${account_name}"
 readonly host_platform="${HOST_PLATFORM:-windows}"
 readonly gpu_enabled="${GPU_ENABLED:-0}"
@@ -17,6 +18,15 @@ if [[ ! -r "${password_file}" ]]; then
     exit 1
 fi
 
+if [[ ! -r "${authorized_keys_file}" ]]; then
+    printf 'ERROR: SSH authorized-keys secret is not readable: %s\n' "${authorized_keys_file}" >&2
+    exit 1
+fi
+if [[ ! -s "${authorized_keys_file}" ]] || ! ssh-keygen -l -f "${authorized_keys_file}" >/dev/null 2>&1; then
+    printf 'ERROR: SSH authorized-keys secret is empty or invalid\n' >&2
+    exit 1
+fi
+
 account_password="$(<"${password_file}")"
 if [[ -z "${account_password}" ]]; then
     printf 'ERROR: password secret is empty\n' >&2
@@ -28,6 +38,12 @@ unset account_password
 
 readonly account_uid="$(id -u "${account_name}")"
 readonly account_gid="$(id -g "${account_name}")"
+
+# Keep authorized keys outside the bind-mounted home. Docker Desktop bind
+# permissions can otherwise make OpenSSH StrictModes reject a valid key.
+install -d -m 0755 -o root -g root /etc/ssh/authorized_keys
+install -m 0644 -o root -g root \
+    "${authorized_keys_file}" "/etc/ssh/authorized_keys/${account_name}"
 
 if [[ "${gpu_enabled}" == 1 ]]; then
     if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -150,6 +166,11 @@ for key_type in rsa ecdsa ed25519; do
     ln -sfn "host_keys/$(basename "${private_key}.pub")" "/etc/ssh/$(basename "${private_key}.pub")"
 done
 sshd -t
+effective_sshd_config="$(sshd -T -C "user=${account_name},host=${account_name},addr=127.0.0.1")"
+grep -qx 'passwordauthentication no' <<<"${effective_sshd_config}"
+grep -qx 'kbdinteractiveauthentication no' <<<"${effective_sshd_config}"
+grep -qx 'authenticationmethods publickey' <<<"${effective_sshd_config}"
+grep -qx 'authorizedkeysfile /etc/ssh/authorized_keys/%u' <<<"${effective_sshd_config}"
 
 rm -f /run/xrdp/xrdp.pid /run/xrdp/xrdp-sesman.pid
 rm -rf /run/xrdp/sockdir

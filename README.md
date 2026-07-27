@@ -35,8 +35,10 @@ Windows PowerShell:
 
 ```powershell
 cd D:\DockerVMs
-powershell -ExecutionPolicy Bypass -File .\NewUbuntuDindEnvironment.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\NewUbuntuDindEnvironment.ps1
 ```
+
+Run the complete command above; `ExecutionPolicy Bypass -File ...` by itself is not a valid PowerShell invocation.
 
 Ubuntu:
 

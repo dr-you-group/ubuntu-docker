@@ -53,6 +53,7 @@ if [[ "${gpu_enabled}" == 1 ]]; then
     nvidia-smi -L
 fi
 
+# BEGIN persistent-bind-storage
 if [[ "${host_platform}" == linux ]]; then
     install -d -m 0750 -o "${account_uid}" -g "${account_gid}" "${account_home}"
     install -d -m 0770 -o "${account_uid}" -g "${account_gid}" /workspace
@@ -75,10 +76,22 @@ for writable_path in "${account_home}" /workspace; do
 done
 
 # A bind-mounted empty home hides files created by useradd in the image.
+home_needs_initialization=false
 if [[ ! -e "${account_home}/.docker-vm-home-initialized" ]]; then
-    cp -an /etc/skel/. "${account_home}/"
-    touch "${account_home}/.docker-vm-home-initialized"
+    home_needs_initialization=true
+    cp -a --update=none /etc/skel/. "${account_home}/"
     find "${account_home}" -mindepth 1 -exec chown -h "${account_uid}:${account_gid}" {} +
+fi
+
+# cp -a preserves the root-owned /etc/skel directory metadata on the home bind
+# root. Restore platform-appropriate bind permissions after initialization so
+# XRDP can create .Xauthority and its per-session Xorg log in the user's home.
+if [[ "${host_platform}" == linux ]]; then
+    chown "${account_uid}:${account_gid}" "${account_home}" /workspace
+    chmod 0750 "${account_home}"
+    chmod 0770 /workspace
+else
+    chmod 0777 "${account_home}" /workspace
 fi
 
 if [[ ! -e "${account_home}/workspace" ]]; then
@@ -87,7 +100,21 @@ if [[ ! -e "${account_home}/workspace" ]]; then
 fi
 
 install -d -m 0700 -o "${account_uid}" -g "${account_gid}" \
+    "${account_home}/.docker" \
     "${account_home}/.docker/dind-certs"
+
+for writable_path in "${account_home}" "${account_home}/.docker" /workspace; do
+    if ! runuser -u "${account_name}" -- test -w "${writable_path}"; then
+        echo "ERROR: ${writable_path} is not writable by ${account_name}; check the bind-mount ACL and mode." >&2
+        exit 1
+    fi
+done
+
+# Write the marker last so an interrupted copy or permission repair is retried.
+if [[ "${home_needs_initialization}" == true ]]; then
+    runuser -u "${account_name}" -- touch "${account_home}/.docker-vm-home-initialized"
+fi
+# END persistent-bind-storage
 
 certificates_ready=false
 for attempt in $(seq 1 120); do

@@ -135,7 +135,17 @@ assert_file_not_contains "${ssh_config}" 'PasswordAuthentication yes'
 
 readonly desktop_entrypoint="${repo_root}/templates/ubuntu-dind/docker_entrypoint.sh"
 assert_file_contains "${desktop_entrypoint}" '    chmod 0777 "${account_home}" /workspace'
+assert_file_contains "${desktop_entrypoint}" '    chown "${account_uid}:${account_gid}" "${account_home}" /workspace'
+assert_file_contains "${desktop_entrypoint}" '    "${account_home}/.docker" \'
+assert_file_contains "${desktop_entrypoint}" 'for writable_path in "${account_home}" "${account_home}/.docker" /workspace; do'
 assert_file_contains "${desktop_entrypoint}" '    if ! runuser -u "${account_name}" -- test -w "${writable_path}"; then'
+home_initialization_line="$(grep -n -F -- '    cp -a --update=none /etc/skel/. "${account_home}/"' "${desktop_entrypoint}" | cut -d: -f1)"
+home_permission_line="$(grep -n -F -- '    chown "${account_uid}:${account_gid}" "${account_home}" /workspace' "${desktop_entrypoint}" | cut -d: -f1 | tail -n 1)"
+writable_check_line="$(grep -n -F -- 'for writable_path in "${account_home}" "${account_home}/.docker" /workspace; do' "${desktop_entrypoint}" | cut -d: -f1)"
+[[ "${home_initialization_line}" =~ ^[0-9]+$ && "${home_permission_line}" =~ ^[0-9]+$ && "${writable_check_line}" =~ ^[0-9]+$ ]] ||
+    fail 'Could not locate desktop home initialization permission checks'
+(( home_initialization_line < home_permission_line && home_permission_line < writable_check_line )) ||
+    fail 'Desktop home permissions must be restored after skeleton initialization and before writability checks'
 
 readonly desktop_dockerfile="${repo_root}/templates/ubuntu-dind/Dockerfile"
 assert_file_contains "${desktop_dockerfile}" 'RUN if getent passwd ubuntu >/dev/null 2>&1; then userdel --remove ubuntu; fi \'

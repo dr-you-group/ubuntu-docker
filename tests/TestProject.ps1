@@ -609,6 +609,26 @@ Assert-True (
 Assert-True (
     $DesktopEntrypoint.Contains('runuser -u "${account_name}" -- test -w "${writable_path}"')
 ) 'desktop entrypoint fails fast when bind storage is not writable'
+Assert-True (
+    $DesktopEntrypoint.Contains('    "${account_home}/.docker" \')
+) 'desktop Docker configuration directory is explicitly user-owned'
+$HomeInitializationIndex = $DesktopEntrypoint.IndexOf(
+    '    cp -a --update=none /etc/skel/. "${account_home}/"',
+    [StringComparison]::Ordinal
+)
+$HomePermissionIndex = $DesktopEntrypoint.IndexOf(
+    '    chown "${account_uid}:${account_gid}" "${account_home}" /workspace',
+    [StringComparison]::Ordinal
+)
+$WritableCheckIndex = $DesktopEntrypoint.IndexOf(
+    'for writable_path in "${account_home}" "${account_home}/.docker" /workspace; do',
+    [StringComparison]::Ordinal
+)
+Assert-True (
+    $HomeInitializationIndex -ge 0 -and
+    $HomePermissionIndex -gt $HomeInitializationIndex -and
+    $WritableCheckIndex -gt $HomePermissionIndex
+) 'desktop home permissions are restored after skeleton initialization and before writability checks'
 
 $ComposeTemplate = [IO.File]::ReadAllText((Join-Path $RepoRoot 'templates\ubuntu-dind\compose.yaml.template'))
 Assert-True ($ComposeTemplate.Contains('"${HOST_ADDRESS}:${RDP_PORT}:3389"')) 'LAN RDP port mapping'

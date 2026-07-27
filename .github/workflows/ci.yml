@@ -30,6 +30,8 @@ jobs:
           fi
       - name: Run Linux tests
         run: bash tests/test_project.sh
+      - name: Test persistent desktop home permissions
+        run: bash tests/test_desktop_home_permissions.sh
       - name: Test Cloudflare API contract without credentials or network calls
         run: bash tests/test_cloudflare_api_mock.sh
       - name: Render Cloudflare environment with fake API and verify rollback

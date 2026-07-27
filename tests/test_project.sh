@@ -110,6 +110,12 @@ assert_equal '10.200.0.10/24' "$(canonicalize_wireguard_address '010.200.000.010
 
 expect_success 'Overlapping CIDRs detected' cidr_ranges_overlap '10.0.0.0/24' '10.0.0.128/25'
 expect_failure 'Separate CIDRs remain separate' cidr_ranges_overlap '10.0.0.0/24' '10.0.1.0/24'
+expect_success 'RFC1918 Cloudflare pool accepted' validate_private_ipv4_cidr '10.210.0.0/24'
+expect_failure 'Public Cloudflare pool rejected' validate_private_ipv4_cidr '203.0.113.0/24'
+expect_success 'Cloudflare Tunnel UUID accepted' \
+    validate_cloudflare_identifier '11111111-2222-4333-8444-555555555555'
+expect_failure 'Malformed Cloudflare resource ID rejected' \
+    validate_cloudflare_identifier 'not-a-cloudflare-id'
 
 expect_success 'Unlimited CPU accepted' validate_cpu_value '-1'
 expect_success 'Quarter CPU accepted' validate_cpu_value '0.25'
@@ -127,22 +133,56 @@ assert_file_contains "${ssh_config}" 'AuthenticationMethods publickey'
 assert_file_contains "${ssh_config}" 'PermitRootLogin no'
 assert_file_not_contains "${ssh_config}" 'PasswordAuthentication yes'
 
+readonly desktop_entrypoint="${repo_root}/templates/ubuntu-dind/docker_entrypoint.sh"
+assert_file_contains "${desktop_entrypoint}" '    chmod 0777 "${account_home}" /workspace'
+assert_file_contains "${desktop_entrypoint}" '    if ! runuser -u "${account_name}" -- test -w "${writable_path}"; then'
+
 readonly compose_template="${repo_root}/templates/ubuntu-dind/compose.yaml.template"
 grep -Fq -- '"${HOST_ADDRESS}:${RDP_PORT}:3389"' "${compose_template}" ||
     fail 'LAN RDP mapping is missing'
-grep -Fq -- 'network_mode: service:wireguard' "${compose_template}" ||
-    fail 'Remote proxy does not share the WireGuard namespace'
-grep -Fq -- '/dev/net/tun:/dev/net/tun' "${compose_template}" ||
-    fail 'WireGuard TUN device mapping is missing'
-grep -Fq -- 'internal: true' "${compose_template}" ||
-    fail 'Remote-access network is not internal'
 ! grep -Fq -- '"${HOST_ADDRESS}:3389:3389"' "${compose_template}" ||
     fail 'Reserved host port 3389 is published'
+for token in \
+    '__DESKTOP_REMOTE_NETWORKS__' \
+    '__REMOTE_ACCESS_SERVICES__' \
+    '__REMOTE_ACCESS_SECRETS__' \
+    '__REMOTE_ACCESS_VOLUMES__' \
+    '__REMOTE_ACCESS_NETWORKS__'; do
+    grep -Fq -- "${token}" "${compose_template}" ||
+        fail "Provider template slot is missing: ${token}"
+done
 
-wireguard_block="$(sed -n '/^  wireguard:/,/^  remote_proxy:/p' "${compose_template}")"
+readonly cloudflare_fragment="${repo_root}/templates/ubuntu-dind/compose.cloudflare.services.template"
+[[ -f "${cloudflare_fragment}" ]] || fail 'Cloudflare Compose service fragment is missing'
+grep -Eq -- '^    image: cloudflare/cloudflared:[^[:space:]@]+@sha256:[0-9a-f]{64}$' \
+    "${cloudflare_fragment}" || fail 'cloudflared image is not pinned by tag and SHA-256 digest'
+grep -Fqx -- '      - --token-file' "${cloudflare_fragment}" ||
+    fail 'cloudflared does not use --token-file'
+grep -Fqx -- '      - /run/secrets/cloudflared_token' "${cloudflare_fragment}" ||
+    fail 'cloudflared token-file path is missing'
+grep -Fqx -- '    cap_drop:' "${cloudflare_fragment}" ||
+    fail 'cloudflared cap_drop is missing'
+grep -Fqx -- '      - ALL' "${cloudflare_fragment}" ||
+    fail 'cloudflared does not drop all capabilities'
+grep -Fqx -- '    read_only: true' "${cloudflare_fragment}" ||
+    fail 'cloudflared root filesystem is not read-only'
+for forbidden in '/dev/net/tun' 'NET_ADMIN' 'privileged:' 'CLOUDFLARE_API_TOKEN'; do
+    ! grep -Fq -- "${forbidden}" "${cloudflare_fragment}" ||
+        fail "Cloudflare fragment contains forbidden runtime setting: ${forbidden}"
+done
+grep -Fq -- 'cloudflared_token' "${cloudflare_fragment}" ||
+    fail 'Cloudflare fragment does not mount the tunnel-specific runtime secret'
+
+readonly wireguard_fragment="${repo_root}/templates/ubuntu-dind/compose.wireguard.services.template"
+[[ -f "${wireguard_fragment}" ]] || fail 'WireGuard Compose service fragment is missing'
+grep -Fq -- 'network_mode: service:wireguard' "${wireguard_fragment}" ||
+    fail 'Remote proxy does not share the WireGuard namespace'
+grep -Fq -- '/dev/net/tun:/dev/net/tun' "${wireguard_fragment}" ||
+    fail 'WireGuard TUN device mapping is missing'
+wireguard_block="$(sed -n '/^  wireguard:/,/^  remote_proxy:/p' "${wireguard_fragment}")"
 [[ "${wireguard_block}" != *'privileged: true'* ]] || fail 'WireGuard service is privileged'
 [[ "${wireguard_block}" == *'- NET_ADMIN'* ]] || fail 'WireGuard service lacks NET_ADMIN'
-proxy_block="$(sed -n '/^  remote_proxy:/,/^secrets:/p' "${compose_template}")"
+proxy_block="$(sed -n '/^  remote_proxy:/,$p' "${wireguard_fragment}")"
 [[ "${proxy_block}" == *'- NET_BIND_SERVICE'* ]] || fail 'Remote proxy lacks NET_BIND_SERVICE'
 [[ "${proxy_block}" != *'/var/lib/wireguard'* ]] || fail 'Remote proxy mounts WireGuard state'
 

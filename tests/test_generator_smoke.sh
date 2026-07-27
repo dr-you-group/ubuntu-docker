@@ -92,6 +92,7 @@ printf '%s\n' "${password_value}" | PATH="${fake_bin}:${PATH}" \
     --remote-subnet "${remote_subnet}" \
     --ssh-port "${ssh_port}" \
     --rdp-port "${rdp_port}" \
+    --remote-access-provider wireguard \
     --wireguard-hub-endpoint '192.0.2.1:51820' \
     --wireguard-hub-public-key "${hub_public_key}" \
     --wireguard-address "${wireguard_address}" \
@@ -178,7 +179,8 @@ assert rdp_port in published
 assert "3389" not in published
 assert "ports" not in services["docker"]
 
-assert metadata["schemaVersion"] == 3
+assert metadata["schemaVersion"] == 4
+assert metadata["remoteAccessProvider"] == "wireguard"
 assert metadata["sshAuthentication"] == "key-only"
 assert metadata["hostPort3389Reserved"] is True
 assert metadata["wireguardIp"] == "10.253.77.10"

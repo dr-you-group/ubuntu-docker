@@ -56,7 +56,7 @@ services:
     networks:
       environment:
         gw_priority: 1
-      remote_access: {}
+__DESKTOP_REMOTE_NETWORKS__
 
   docker:
     build:
@@ -104,91 +104,14 @@ services:
     networks:
       - environment
 
-  wireguard:
-    build:
-      context: .
-      dockerfile: Dockerfile.wireguard
-    image: ${ENVIRONMENT_NAME}-wireguard:${IMAGE_TAG}
-    hostname: ${ENVIRONMENT_NAME}-wireguard
-    restart: unless-stopped
-    init: true
-    cap_drop:
-      - ALL
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    security_opt:
-      - no-new-privileges:true
-    read_only: true
-    pids_limit: 128
-    environment:
-      ENVIRONMENT_NAME: "${ENVIRONMENT_NAME}"
-      WIREGUARD_ADDRESS: "${WIREGUARD_ADDRESS}"
-      WIREGUARD_NETWORK: "${WIREGUARD_NETWORK}"
-      WIREGUARD_HUB_ENDPOINT: "${WIREGUARD_HUB_ENDPOINT}"
-      WIREGUARD_HUB_PUBLIC_KEY: "${WIREGUARD_HUB_PUBLIC_KEY}"
-      WIREGUARD_MTU: "${WIREGUARD_MTU:-1380}"
-      WIREGUARD_KEEPALIVE: "${WIREGUARD_KEEPALIVE:-25}"
-    volumes:
-      - type: volume
-        source: wireguard_state
-        target: /var/lib/wireguard
-    tmpfs:
-      - /etc/wireguard:mode=0700
-      - /run:mode=0755
-      - /tmp:mode=1777
-    healthcheck:
-      test: ["CMD-SHELL", "wg show wg0 >/dev/null 2>&1 && test -s /var/lib/wireguard/public.key && test -s /var/lib/wireguard/hub_peer.conf"]
-      interval: 10s
-      timeout: 5s
-      start_period: 30s
-      retries: 12
-    networks:
-      wireguard_transport:
-        gw_priority: 1
-      remote_access: {}
-
-  remote_proxy:
-    image: ${ENVIRONMENT_NAME}-wireguard:${IMAGE_TAG}
-    pull_policy: never
-    restart: unless-stopped
-    init: true
-    cap_drop:
-      - ALL
-    cap_add:
-      - NET_BIND_SERVICE
-    security_opt:
-      - no-new-privileges:true
-    read_only: true
-    pids_limit: 128
-    environment:
-      WIREGUARD_ADDRESS: "${WIREGUARD_ADDRESS}"
-      SSH_TARGET: desktop:22
-      RDP_TARGET: desktop:3389
-    entrypoint:
-      - /usr/local/sbin/remote_proxy_entrypoint.sh
-    tmpfs:
-      - /run:mode=0755
-      - /tmp:mode=1777
-    depends_on:
-      desktop:
-        condition: service_healthy
-      wireguard:
-        condition: service_healthy
-    network_mode: service:wireguard
-    healthcheck:
-      test: ["CMD", "/usr/local/sbin/remote_proxy_healthcheck.sh"]
-      interval: 10s
-      timeout: 5s
-      start_period: 15s
-      retries: 12
+__REMOTE_ACCESS_SERVICES__
 
 secrets:
   login_password:
     file: ./secrets/login_password.txt
   ssh_authorized_keys:
     file: ./secrets/ssh_authorized_keys
+__REMOTE_ACCESS_SECRETS__
 
 volumes:
   dind_data:
@@ -201,14 +124,9 @@ volumes:
     name: ${ENVIRONMENT_NAME}_dind_server_certs
   ssh_host_keys:
     name: ${ENVIRONMENT_NAME}_ssh_host_keys
-  wireguard_state:
-    name: ${ENVIRONMENT_NAME}_wireguard_state
+__REMOTE_ACCESS_VOLUMES__
 
 networks:
   environment:
     name: ${ENVIRONMENT_NAME}_environment
-  remote_access:
-    name: ${ENVIRONMENT_NAME}_remote_access
-    internal: true
-  wireguard_transport:
-    name: ${ENVIRONMENT_NAME}_wireguard_transport
+__REMOTE_ACCESS_NETWORKS__

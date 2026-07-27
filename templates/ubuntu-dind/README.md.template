@@ -1,44 +1,18 @@
 # __ENVIRONMENT_NAME__ Ubuntu Environment
 
-Ubuntu 26.04 desktop with key-only SSH, RDP, persistent storage, WireGuard remote access, and an isolated Docker-in-Docker engine.
+Ubuntu 26.04 desktop with key-only SSH, RDP, persistent storage, __REMOTE_ACCESS_SUMMARY__, and an isolated Docker-in-Docker engine.
 
 ## Connect
 
 | Connection | Target | File or command |
 | --- | --- | --- |
 | Local SSH | `__HOST_ADDRESS__:__SSH_PORT__` | `ssh -o IdentitiesOnly=yes -i "__SSH_PRIVATE_KEY__" -p __SSH_PORT__ __ACCOUNT_NAME__@__HOST_ADDRESS__` |
-| Remote SSH | `__WIREGUARD_IP__:22` | `ssh -o IdentitiesOnly=yes -i "__SSH_PRIVATE_KEY__" __ACCOUNT_NAME__@__WIREGUARD_IP__` |
 | Local RDP | `__HOST_ADDRESS__:__RDP_PORT__` | `__LOCAL_RDP_FILE__` |
-| Remote RDP | `__WIREGUARD_IP__:3389` | `__REMOTE_RDP_FILE__` |
+__REMOTE_CONNECTION_ROWS__
 
 SSH accepts only the generated private key. Keep `__SSH_PRIVATE_KEY__` private; its fingerprint is `__SSH_FINGERPRINT__`. After copying it to macOS/Linux, run `chmod 600` on the copy. The account password entered during creation is used for RDP and `sudo`, but it is not stored in either RDP file.
 
-For remote access, connect the client device to the same WireGuard Hub before using the remote SSH command or RDP file.
-
-## Register with the WireGuard Hub
-
-- Environment address: `__WIREGUARD_ADDRESS__`
-- VPN network: `__WIREGUARD_NETWORK__`
-- Hub endpoint: `__WIREGUARD_HUB_ENDPOINT__`
-
-After the first `docker compose up -d`, add this generated peer block to the Hub and reload its configuration:
-
-```text
-__WIREGUARD_HUB_PEER_FILE__
-```
-
-If the files are missing or the WireGuard identity was rotated, export the public data again:
-
-```bash
-docker compose cp wireguard:/var/lib/wireguard/public.key __WIREGUARD_PUBLIC_KEY_FILE__
-docker compose cp wireguard:/var/lib/wireguard/hub_peer.conf __WIREGUARD_HUB_PEER_FILE__
-```
-
-The Hub must forward authorized client peers to `__WIREGUARD_IP__/32` on TCP ports `22` and `3389`. Give those client peers tunnel addresses inside `__WIREGUARD_NETWORK__` so reply traffic returns through the Hub. The host does not publish a WireGuard UDP port; the sidecar connects outbound to the Hub. The environment private WireGuard key stays in the `__WIREGUARD_STATE_VOLUME__` Docker volume.
-
-Keep this `/32` unique across every Docker host attached to the Hub. Remove the Hub peer when this environment is deleted.
-
-Container health confirms only the local WireGuard interface and SSH/RDP proxies. After registering the Hub peer, verify that `docker compose exec -T wireguard wg show wg0 latest-handshakes` reports a nonzero timestamp, then test remote SSH and RDP.
+__REMOTE_ACCESS_INSTRUCTIONS__
 
 ## Use Docker
 
@@ -93,4 +67,4 @@ Reapply the LAN-only host firewall policy with administrator/root privileges:
 __FIREWALL_COMMAND__
 ```
 
-Do not run `docker compose down -v`; it deletes DinD data, SSH host keys, and the WireGuard identity. Firefox and Korean input are preconfigured.
+__REMOTE_DATA_WARNING__ Firefox and Korean input are preconfigured.

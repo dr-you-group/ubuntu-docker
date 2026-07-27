@@ -24,6 +24,25 @@ WIREGUARD_IP=''
 WIREGUARD_NETWORK=''
 WIREGUARD_MTU=''
 WIREGUARD_KEEPALIVE=''
+REMOTE_ACCESS_PROVIDER=''
+REMOTE_ACCESS_PROVIDER_EXPLICIT='0'
+CLOUDFLARE_API_TOKEN=''
+CLOUDFLARE_ACCOUNT_ID=''
+CLOUDFLARE_TEAM_NAME=''
+CLOUDFLARE_PRIVATE_CIDR=''
+CLOUDFLARE_PRIVATE_IP=''
+CLOUDFLARE_PRIVATE_SUBNET=''
+CLOUDFLARE_TUNNEL_NAME=''
+CLOUDFLARE_TUNNEL_ID=''
+CLOUDFLARE_ROUTE_ID=''
+CLOUDFLARE_TUNNEL_TOKEN_FILE='secrets/cloudflared_tunnel_token'
+CLOUDFLARE_API_WORK_PATH=''
+CLOUDFLARE_ROUTES_SNAPSHOT=''
+CLOUDFLARE_TUNNEL_CREATED='0'
+CLOUDFLARE_ROUTE_CREATED='0'
+CLOUDFLARE_API_LAST_ERROR=''
+CLOUDFLARE_API_LAST_HTTP_STATUS=''
+CLOUDFLARE_API_LAST_AMBIGUOUS='0'
 DESKTOP_CPUS=''
 DESKTOP_MEMORY=''
 DIND_CPUS=''
@@ -98,6 +117,10 @@ Network and resources:
   --remote-subnet CIDR
   --ssh-port PORT
   --rdp-port PORT               Must be 3390 or higher; host 3389 is reserved.
+  --remote-access-provider PROVIDER
+                                cloudflare (default for new environments) or
+                                wireguard. Existing environments keep their
+                                recorded/inferred provider.
   --wireguard-hub-endpoint HOST:PORT
                                 Public Hub IPv4 literal or DNS hostname and port.
   --wireguard-hub-public-key KEY
@@ -408,6 +431,7 @@ read_environment_value() {
     awk -F= -v key="${key}" '
         $1 == key {
             value = substr($0, index($0, "=") + 1)
+            sub(/\r$/, "", value)
             if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) {
                 value = substr(value, 2, length(value) - 2)
             }
@@ -442,6 +466,767 @@ select_default_wireguard_address() {
         fi
     done
     return 1
+}
+
+read_manifest_string() {
+    local file="$1"
+    local key="$2"
+    [[ -f "${file}" ]] || return 1
+    awk -v key="${key}" '
+        $0 ~ "\"" key "\"[[:space:]]*:" {
+            value = $0
+            sub("^.*\"" key "\"[[:space:]]*:[[:space:]]*\"", "", value)
+            sub("\"[[:space:]]*,?[[:space:]]*$", "", value)
+            print value
+            exit
+        }
+    ' "${file}"
+}
+
+select_remote_access_provider() {
+    local existing_provider=''
+    local manifest="${TARGET_PATH}/.environment.json"
+
+    if [[ "${OLD_TARGET_EXISTED}" == 1 ]]; then
+        existing_provider="$(read_manifest_string "${manifest}" remoteAccessProvider || true)"
+        # Schema 3 and older manifests have no provider field and are WireGuard
+        # environments. An older directory without a manifest is treated the
+        # same way so a replacement can never migrate it implicitly.
+        [[ -n "${existing_provider}" ]] || existing_provider='wireguard'
+        case "${existing_provider}" in
+            cloudflare|wireguard) ;;
+            *) die "Unsupported remote-access provider in ${manifest}: ${existing_provider}" ;;
+        esac
+        if [[ "${REMOTE_ACCESS_PROVIDER_EXPLICIT}" == 1 && "${REMOTE_ACCESS_PROVIDER}" != "${existing_provider}" ]]; then
+            die "Existing environment uses ${existing_provider}; automatic provider migration is not supported."
+        fi
+        REMOTE_ACCESS_PROVIDER="${existing_provider}"
+    elif [[ -z "${REMOTE_ACCESS_PROVIDER}" ]]; then
+        read_with_default REMOTE_ACCESS_PROVIDER 'Remote access provider' 'cloudflare'
+        REMOTE_ACCESS_PROVIDER="${REMOTE_ACCESS_PROVIDER,,}"
+    fi
+
+    case "${REMOTE_ACCESS_PROVIDER}" in
+        cloudflare|wireguard) ;;
+        *) die '--remote-access-provider must be cloudflare or wireguard.' ;;
+    esac
+}
+
+cidr_is_contained_by() {
+    local child="$1"
+    local parent="$2"
+    local child_address child_prefix parent_address parent_prefix
+    local child_mask parent_mask child_start child_end parent_start parent_end
+
+    child_address="${child%/*}"
+    child_prefix=$((10#${child##*/}))
+    parent_address="${parent%/*}"
+    parent_prefix=$((10#${parent##*/}))
+    child_mask=$(( child_prefix == 0 ? 0 : (0xFFFFFFFF << (32 - child_prefix)) & 0xFFFFFFFF ))
+    parent_mask=$(( parent_prefix == 0 ? 0 : (0xFFFFFFFF << (32 - parent_prefix)) & 0xFFFFFFFF ))
+    child_start=$(( $(ipv4_to_integer "${child_address}") & child_mask ))
+    parent_start=$(( $(ipv4_to_integer "${parent_address}") & parent_mask ))
+    child_end=$(( child_start | ((~child_mask) & 0xFFFFFFFF) ))
+    parent_end=$(( parent_start | ((~parent_mask) & 0xFFFFFFFF) ))
+    (( child_start >= parent_start && child_end <= parent_end ))
+}
+
+validate_private_ipv4_cidr() {
+    local value="$1"
+    validate_cidr "${value}" || return 1
+    cidr_is_contained_by "${value}" '10.0.0.0/8' ||
+        cidr_is_contained_by "${value}" '172.16.0.0/12' ||
+        cidr_is_contained_by "${value}" '192.168.0.0/16'
+}
+
+load_cloudflare_config() {
+    local config_file="${SCRIPT_DIRECTORY}/.env"
+    local value prefix canonical permission owner_uid
+
+    [[ -f "${config_file}" && ! -L "${config_file}" ]] ||
+        die "Cloudflare configuration file is missing or unsafe: ${config_file}"
+    owner_uid="$(stat -c '%u' "${config_file}")"
+    [[ "${owner_uid}" == "$(id -u)" ]] ||
+        die 'The repository .env must be owned by the user running this generator.'
+    permission="$(stat -c '%a' "${config_file}")"
+    [[ "${permission}" =~ ^(400|600)$ ]] ||
+        die 'The repository .env must have mode 400 or 600 (no group/other access).'
+    value="$(read_environment_value "${config_file}" CLOUDFLARE_API_TOKEN || true)"
+    [[ "${value}" =~ ^[A-Za-z0-9_-]{20,200}$ ]] ||
+        die 'CLOUDFLARE_API_TOKEN is missing or malformed in the repository .env file.'
+    CLOUDFLARE_API_TOKEN="${value}"
+
+    CLOUDFLARE_ACCOUNT_ID="$(read_environment_value "${config_file}" CLOUDFLARE_ACCOUNT_ID || true)"
+    [[ "${CLOUDFLARE_ACCOUNT_ID}" =~ ^[A-Fa-f0-9]{32}$ ]] ||
+        die 'CLOUDFLARE_ACCOUNT_ID must be a 32-character hexadecimal account ID.'
+    CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID,,}"
+
+    CLOUDFLARE_TEAM_NAME="$(read_environment_value "${config_file}" CLOUDFLARE_TEAM_NAME || true)"
+    [[ "${CLOUDFLARE_TEAM_NAME}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] ||
+        die 'CLOUDFLARE_TEAM_NAME must be the team name without .cloudflareaccess.com.'
+
+    CLOUDFLARE_PRIVATE_CIDR="$(read_environment_value "${config_file}" CLOUDFLARE_PRIVATE_CIDR || true)"
+    validate_private_ipv4_cidr "${CLOUDFLARE_PRIVATE_CIDR}" ||
+        die 'CLOUDFLARE_PRIVATE_CIDR must be a valid RFC1918 IPv4 CIDR.'
+    prefix=$((10#${CLOUDFLARE_PRIVATE_CIDR##*/}))
+    (( prefix <= 29 )) || die 'CLOUDFLARE_PRIVATE_CIDR must be large enough to contain at least one /29 network.'
+    canonical="$(network_cidr "${CLOUDFLARE_PRIVATE_CIDR%/*}" "${prefix}")"
+    if [[ "${canonical}" != "${CLOUDFLARE_PRIVATE_CIDR}" ]]; then
+        warn "CLOUDFLARE_PRIVATE_CIDR was normalized to ${canonical}."
+        CLOUDFLARE_PRIVATE_CIDR="${canonical}"
+    fi
+    if cidr_ranges_overlap "${CLOUDFLARE_PRIVATE_CIDR}" "${REMOTE_SUBNET}"; then
+        die "Cloudflare private pool ${CLOUDFLARE_PRIVATE_CIDR} overlaps the LAN subnet ${REMOTE_SUBNET}."
+    fi
+
+    if [[ "${GENERATE_ONLY}" == 1 ]]; then
+        die '--generate-only does not provision Cloudflare resources and is unavailable with the cloudflare provider; use a normal run or select wireguard explicitly.'
+    fi
+}
+
+initialize_cloudflare_api_workspace() {
+    local journal
+    [[ -z "${CLOUDFLARE_API_WORK_PATH}" ]] || return 0
+    CLOUDFLARE_API_WORK_PATH="$(mktemp -d -- "${ROOT_PATH}/.staging/.cloudflare-api.XXXXXXXXXX")" ||
+        die 'Could not create the Cloudflare API workspace.'
+    case "${CLOUDFLARE_API_WORK_PATH}" in
+        "${ROOT_PATH}/.staging/.cloudflare-api."*) ;;
+        *) die "Refusing unexpected Cloudflare API workspace: ${CLOUDFLARE_API_WORK_PATH}" ;;
+    esac
+    chmod 0700 "${CLOUDFLARE_API_WORK_PATH}"
+    journal="${CLOUDFLARE_API_WORK_PATH}/created-resources.journal"
+    printf 'journalVersion=1\naccountId=%s\n' "${CLOUDFLARE_ACCOUNT_ID}" >"${journal}"
+    chmod 0600 "${journal}"
+}
+
+cloudflare_api_request() {
+    local method="$1"
+    local path="$2"
+    local body_file="${3:-}"
+    local response_file="${CLOUDFLARE_API_WORK_PATH}/response.json"
+    local status=''
+    local -a curl_arguments=(
+        --silent --show-error
+        --connect-timeout 15 --max-time 90
+        --request "${method}"
+        --url "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}${path}"
+        --header 'Content-Type: application/json'
+        --output "${response_file}"
+        --write-out '%{http_code}'
+    )
+
+    # GET and DELETE are safe to retry. POST is deliberately never retried:
+    # a lost creation response can otherwise leave duplicate orphan resources.
+    case "${method}" in
+        GET|DELETE) curl_arguments+=(--retry 2 --retry-all-errors) ;;
+    esac
+    [[ -z "${body_file}" ]] || curl_arguments+=(--data-binary "@${body_file}")
+    : >"${response_file}"
+    chmod 0600 "${response_file}"
+
+    # Supplying Authorization through curl's stdin config keeps the management
+    # token out of argv, process listings, generated files, and command output.
+    CLOUDFLARE_API_LAST_HTTP_STATUS=''
+    CLOUDFLARE_API_LAST_AMBIGUOUS='0'
+    if ! status="$(
+        printf 'header = "Authorization: Bearer %s"\n' "${CLOUDFLARE_API_TOKEN}" |
+            curl --config - "${curl_arguments[@]}"
+    )"; then
+        CLOUDFLARE_API_LAST_ERROR='Cloudflare API transport failed.'
+        [[ "${method}" != POST ]] || CLOUDFLARE_API_LAST_AMBIGUOUS='1'
+        return 1
+    fi
+    CLOUDFLARE_API_LAST_HTTP_STATUS="${status}"
+    if [[ ! "${status}" =~ ^2[0-9][0-9]$ ]] ||
+        ! python3 -c 'import json,sys; data=json.load(open(sys.argv[1], encoding="utf-8")); raise SystemExit(0 if data.get("success") is True else 1)' "${response_file}" >/dev/null 2>&1; then
+        CLOUDFLARE_API_LAST_ERROR="Cloudflare API rejected the request (HTTP ${status})."
+        if [[ "${method}" == POST && "${status}" =~ ^5[0-9][0-9]$ ]]; then
+            CLOUDFLARE_API_LAST_AMBIGUOUS='1'
+        fi
+        return 1
+    fi
+    CLOUDFLARE_API_LAST_ERROR=''
+    return 0
+}
+
+require_cloudflare_api_request() {
+    local operation="$1"
+    shift
+    cloudflare_api_request "$@" || die "${operation} failed (${CLOUDFLARE_API_LAST_ERROR})."
+}
+
+validate_cloudflare_api_access() {
+    local response_file="${CLOUDFLARE_API_WORK_PATH}/response.json"
+
+    require_cloudflare_api_request 'Cloudflare Tunnel permission check' GET '/cfd_tunnel?is_deleted=false&per_page=1'
+    require_cloudflare_api_request 'Cloudflare private-network permission check' GET '/teamnet/routes?is_deleted=false&per_page=1000'
+    CLOUDFLARE_ROUTES_SNAPSHOT="${CLOUDFLARE_API_WORK_PATH}/routes.json"
+    install -m 0600 -- "${response_file}" "${CLOUDFLARE_ROUTES_SNAPSHOT}"
+}
+
+cloudflare_candidate_conflicts_with_generated_environment() {
+    local candidate="$1"
+    local environment_file configured_subnet configured_wireguard
+
+    while IFS= read -r -d '' environment_file; do
+        [[ "${environment_file}" != "${TARGET_PATH}/.env" ]] || continue
+        configured_subnet="$(read_environment_value "${environment_file}" CLOUDFLARE_PRIVATE_SUBNET || true)"
+        if validate_cidr "${configured_subnet}" && cidr_ranges_overlap "${candidate}" "${configured_subnet}"; then
+            return 0
+        fi
+        configured_wireguard="$(read_environment_value "${environment_file}" WIREGUARD_NETWORK || true)"
+        if validate_cidr "${configured_wireguard}" && cidr_ranges_overlap "${candidate}" "${configured_wireguard}"; then
+            return 0
+        fi
+    done < <(find "${ROOT_PATH}" -mindepth 2 -maxdepth 2 -type f -name .env -print0 2>/dev/null)
+    return 1
+}
+
+cloudflare_candidate_conflicts_with_host() {
+    local candidate="$1"
+    local route network_id subnet
+
+    while IFS= read -r route; do
+        validate_cidr "${route}" || continue
+        if cidr_ranges_overlap "${candidate}" "${route}"; then
+            return 0
+        fi
+    done < <(ip -4 route show 2>/dev/null | awk '$1 ~ /^[0-9]+([.][0-9]+){3}\/[0-9]+$/ { print $1 }')
+
+    while IFS= read -r network_id; do
+        [[ -n "${network_id}" ]] || continue
+        while IFS= read -r subnet; do
+            validate_cidr "${subnet}" || continue
+            if cidr_ranges_overlap "${candidate}" "${subnet}"; then
+                return 0
+            fi
+        done < <(docker network inspect --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' "${network_id}" 2>/dev/null || true)
+    done < <(docker network ls -q 2>/dev/null || true)
+    return 1
+}
+
+cloudflare_candidate_conflicts_with_account_route() {
+    local candidate="$1"
+    local route
+    [[ -s "${CLOUDFLARE_ROUTES_SNAPSHOT}" ]] || return 1
+    while IFS= read -r route; do
+        validate_cidr "${route}" || continue
+        if cidr_ranges_overlap "${candidate}" "${route}"; then
+            return 0
+        fi
+    done < <(python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+for route in data.get("result") or []:
+    network = route.get("network")
+    if isinstance(network, str):
+        print(network)
+' "${CLOUDFLARE_ROUTES_SNAPSHOT}" 2>/dev/null)
+    return 1
+}
+
+select_cloudflare_private_allocation() {
+    local pool_prefix pool_start pool_mask pool_end candidate_start candidate_subnet
+
+    pool_prefix=$((10#${CLOUDFLARE_PRIVATE_CIDR##*/}))
+    pool_mask=$(( (0xFFFFFFFF << (32 - pool_prefix)) & 0xFFFFFFFF ))
+    pool_start=$(( $(ipv4_to_integer "${CLOUDFLARE_PRIVATE_CIDR%/*}") & pool_mask ))
+    pool_end=$(( pool_start | ((~pool_mask) & 0xFFFFFFFF) ))
+
+    for ((candidate_start = pool_start; candidate_start + 7 <= pool_end; candidate_start += 8)); do
+        candidate_subnet="$(integer_to_ipv4 "${candidate_start}")/29"
+        if cidr_ranges_overlap "${candidate_subnet}" "${REMOTE_SUBNET}" ||
+            cloudflare_candidate_conflicts_with_generated_environment "${candidate_subnet}" ||
+            cloudflare_candidate_conflicts_with_host "${candidate_subnet}" ||
+            cloudflare_candidate_conflicts_with_account_route "${candidate_subnet}"; then
+            continue
+        fi
+        CLOUDFLARE_PRIVATE_SUBNET="${candidate_subnet}"
+        # base+1 is Docker's gateway; base+2 is the fixed desktop endpoint.
+        CLOUDFLARE_PRIVATE_IP="$(integer_to_ipv4 "$((candidate_start + 2))")"
+        return 0
+    done
+    die "No unused /29 remains in Cloudflare private pool ${CLOUDFLARE_PRIVATE_CIDR}; choose a non-overlapping pool."
+}
+
+validate_cloudflare_identifier() {
+    local value="$1"
+    [[ "${value}" =~ ^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[1-5][A-Fa-f0-9]{3}-[89ABab][A-Fa-f0-9]{3}-[A-Fa-f0-9]{12}$ ]]
+}
+
+read_json_string() {
+    local file="$1"
+    local key="$2"
+    python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle).get(sys.argv[2], "")
+if isinstance(value, str):
+    print(value)
+' "${file}" "${key}"
+}
+
+cloudflare_response_result_id() {
+    local response_file="$1"
+    python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle).get("result") or {}
+value = result.get("id", "") if isinstance(result, dict) else ""
+if isinstance(value, str):
+    print(value)
+' "${response_file}"
+}
+
+cloudflare_find_tunnel_id_by_name() {
+    local response_file="$1"
+    local tunnel_name="$2"
+    python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle).get("result") or []
+matches = [item.get("id") for item in result
+           if isinstance(item, dict) and item.get("name") == sys.argv[2]
+           and not item.get("deleted_at") and isinstance(item.get("id"), str)]
+if len(matches) != 1:
+    raise SystemExit(1)
+print(matches[0])
+' "${response_file}" "${tunnel_name}"
+}
+
+cloudflare_tunnel_name_is_available() {
+    local response_file="${CLOUDFLARE_API_WORK_PATH}/response.json"
+    require_cloudflare_api_request 'Cloudflare Tunnel-name preflight' GET "/cfd_tunnel?name=${CLOUDFLARE_TUNNEL_NAME}&is_deleted=false&per_page=100"
+    python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle).get("result") or []
+matches = [item for item in result if isinstance(item, dict)
+           and item.get("name") == sys.argv[2] and not item.get("deleted_at")]
+raise SystemExit(0 if not matches else 1)
+' "${response_file}" "${CLOUDFLARE_TUNNEL_NAME}"
+}
+
+reconcile_cloudflare_tunnel_creation() {
+    local response_file="${CLOUDFLARE_API_WORK_PATH}/response.json"
+    require_cloudflare_api_request 'Cloudflare Tunnel creation reconciliation' GET "/cfd_tunnel?name=${CLOUDFLARE_TUNNEL_NAME}&is_deleted=false&per_page=100"
+    CLOUDFLARE_TUNNEL_ID="$(cloudflare_find_tunnel_id_by_name "${response_file}" "${CLOUDFLARE_TUNNEL_NAME}" || true)"
+    validate_cloudflare_identifier "${CLOUDFLARE_TUNNEL_ID}" ||
+        die "Cloudflare Tunnel creation had an ambiguous result; inspect Tunnel name ${CLOUDFLARE_TUNNEL_NAME} in the dashboard."
+}
+
+refresh_cloudflare_routes_snapshot() {
+    local response_file="${CLOUDFLARE_API_WORK_PATH}/response.json"
+    require_cloudflare_api_request 'Cloudflare private-route refresh' GET '/teamnet/routes?is_deleted=false&per_page=1000'
+    install -m 0600 -- "${response_file}" "${CLOUDFLARE_ROUTES_SNAPSHOT}"
+}
+
+cloudflare_find_route_id() {
+    local response_file="$1"
+    local network="$2"
+    local tunnel_id="$3"
+    python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle).get("result") or []
+matches = []
+for item in result:
+    if not isinstance(item, dict) or item.get("network") != sys.argv[2]:
+        continue
+    candidate_tunnel = item.get("tunnel_id", item.get("tunnelId"))
+    if candidate_tunnel == sys.argv[3] and isinstance(item.get("id"), str):
+        matches.append(item["id"])
+if len(matches) != 1:
+    raise SystemExit(1)
+print(matches[0])
+' "${response_file}" "${network}" "${tunnel_id}"
+}
+
+reconcile_cloudflare_route_creation() {
+    refresh_cloudflare_routes_snapshot
+    CLOUDFLARE_ROUTE_ID="$(cloudflare_find_route_id "${CLOUDFLARE_ROUTES_SNAPSHOT}" "${CLOUDFLARE_PRIVATE_IP}/32" "${CLOUDFLARE_TUNNEL_ID}" || true)"
+    validate_cloudflare_identifier "${CLOUDFLARE_ROUTE_ID}" ||
+        die "Cloudflare route creation had an ambiguous result; inspect ${CLOUDFLARE_PRIVATE_IP}/32 in the dashboard."
+}
+
+record_cloudflare_created_resource() {
+    local kind="$1"
+    local identifier="$2"
+    local journal="${CLOUDFLARE_API_WORK_PATH}/created-resources.journal"
+    printf '%s=%s\n' "${kind}" "${identifier}" >>"${journal}"
+    chmod 0600 "${journal}"
+}
+
+provision_cloudflare_remote_access() {
+    local request_file="${CLOUDFLARE_API_WORK_PATH}/request.json"
+    local response_file="${CLOUDFLARE_API_WORK_PATH}/response.json"
+    local tunnel_token=''
+    local creation_error=''
+
+    select_cloudflare_private_allocation
+    CLOUDFLARE_TUNNEL_NAME="dockervm-${ENVIRONMENT_NAME}"
+    cloudflare_tunnel_name_is_available ||
+        die "An active Cloudflare Tunnel named ${CLOUDFLARE_TUNNEL_NAME} already exists; refusing to take ownership of it."
+    record_cloudflare_created_resource environmentName "${ENVIRONMENT_NAME}"
+    record_cloudflare_created_resource tunnelName "${CLOUDFLARE_TUNNEL_NAME}"
+    record_cloudflare_created_resource privateIp "${CLOUDFLARE_PRIVATE_IP}"
+    record_cloudflare_created_resource dockerSubnet "${CLOUDFLARE_PRIVATE_SUBNET}"
+    record_cloudflare_created_resource tunnelCreationStarted 1
+
+    python3 -c '
+import json, sys
+json.dump({"name": sys.argv[1], "config_src": "cloudflare"}, sys.stdout, separators=(",", ":"))
+' "${CLOUDFLARE_TUNNEL_NAME}" >"${request_file}"
+    chmod 0600 "${request_file}"
+    if cloudflare_api_request POST '/cfd_tunnel' "${request_file}"; then
+        CLOUDFLARE_TUNNEL_ID="$(cloudflare_response_result_id "${response_file}" || true)"
+        if ! validate_cloudflare_identifier "${CLOUDFLARE_TUNNEL_ID}"; then
+            reconcile_cloudflare_tunnel_creation
+        fi
+    else
+        creation_error="${CLOUDFLARE_API_LAST_ERROR}"
+        if [[ "${CLOUDFLARE_API_LAST_AMBIGUOUS}" == 1 ]]; then
+            reconcile_cloudflare_tunnel_creation
+        else
+            die "Cloudflare Tunnel creation failed (${creation_error})."
+        fi
+    fi
+    CLOUDFLARE_TUNNEL_CREATED='1'
+    record_cloudflare_created_resource tunnelId "${CLOUDFLARE_TUNNEL_ID}"
+
+    require_cloudflare_api_request 'Cloudflare Tunnel token retrieval' GET "/cfd_tunnel/${CLOUDFLARE_TUNNEL_ID}/token"
+    tunnel_token="$(python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle).get("result")
+if isinstance(result, str):
+    print(result)
+elif isinstance(result, dict) and isinstance(result.get("token"), str):
+    print(result["token"])
+' "${response_file}")"
+    [[ "${tunnel_token}" =~ ^[-A-Za-z0-9._=+/]{20,4096}$ ]] ||
+        die 'Cloudflare returned a malformed Tunnel runtime token.'
+    install -m 0600 /dev/null "${STAGING_PATH}/${CLOUDFLARE_TUNNEL_TOKEN_FILE}"
+    printf '%s' "${tunnel_token}" >"${STAGING_PATH}/${CLOUDFLARE_TUNNEL_TOKEN_FILE}"
+    chmod 0444 "${STAGING_PATH}/${CLOUDFLARE_TUNNEL_TOKEN_FILE}"
+    tunnel_token=''
+    : >"${response_file}"
+
+    refresh_cloudflare_routes_snapshot
+    if cloudflare_candidate_conflicts_with_account_route "${CLOUDFLARE_PRIVATE_SUBNET}"; then
+        die "A Cloudflare route created during provisioning now overlaps ${CLOUDFLARE_PRIVATE_SUBNET}; retry with another allocation."
+    fi
+    python3 -c '
+import json, sys
+json.dump({"network": sys.argv[1], "tunnel_id": sys.argv[2], "comment": sys.argv[3]},
+          sys.stdout, separators=(",", ":"))
+' "${CLOUDFLARE_PRIVATE_IP}/32" "${CLOUDFLARE_TUNNEL_ID}" \
+        "DockerVM environment ${ENVIRONMENT_NAME}; managed by ${SCRIPT_NAME}" >"${request_file}"
+    if cloudflare_api_request POST '/teamnet/routes' "${request_file}"; then
+        CLOUDFLARE_ROUTE_ID="$(cloudflare_response_result_id "${response_file}" || true)"
+        if ! validate_cloudflare_identifier "${CLOUDFLARE_ROUTE_ID}"; then
+            reconcile_cloudflare_route_creation
+        fi
+    else
+        creation_error="${CLOUDFLARE_API_LAST_ERROR}"
+        if [[ "${CLOUDFLARE_API_LAST_AMBIGUOUS}" == 1 ]]; then
+            reconcile_cloudflare_route_creation
+        else
+            die "Cloudflare private route creation failed (${creation_error})."
+        fi
+    fi
+    CLOUDFLARE_ROUTE_CREATED='1'
+    record_cloudflare_created_resource routeId "${CLOUDFLARE_ROUTE_ID}"
+    rm -f -- "${request_file}" "${response_file}"
+}
+
+prepare_existing_cloudflare_remote_access() {
+    local manifest="${TARGET_PATH}/.environment.json"
+    local source_token="${TARGET_PATH}/${CLOUDFLARE_TUNNEL_TOKEN_FILE}"
+    local recorded_account recorded_provider recorded_team private_integer network_integer permission response_file
+
+    [[ -f "${manifest}" && ! -L "${manifest}" ]] ||
+        die "Existing Cloudflare environment manifest is missing or unsafe: ${manifest}"
+    python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "${manifest}" 2>/dev/null ||
+        die 'Existing Cloudflare manifest is not valid JSON.'
+    recorded_provider="$(read_json_string "${manifest}" remoteAccessProvider)"
+    [[ "${recorded_provider}" == cloudflare ]] || die 'Existing environment is not recorded as a Cloudflare environment.'
+    recorded_account="$(read_json_string "${manifest}" cloudflareAccountId)"
+    [[ "${recorded_account,,}" == "${CLOUDFLARE_ACCOUNT_ID}" ]] ||
+        die 'The repository .env Cloudflare account does not match the existing environment manifest.'
+    recorded_team="$(read_json_string "${manifest}" cloudflareTeamName)"
+    [[ "${recorded_team}" == "${CLOUDFLARE_TEAM_NAME}" ]] ||
+        die 'The repository .env Cloudflare team name does not match the existing environment manifest.'
+    CLOUDFLARE_TUNNEL_NAME="$(read_json_string "${manifest}" cloudflareTunnelName)"
+    CLOUDFLARE_TUNNEL_ID="$(read_json_string "${manifest}" cloudflareTunnelId)"
+    CLOUDFLARE_ROUTE_ID="$(read_json_string "${manifest}" cloudflareRouteId)"
+    CLOUDFLARE_PRIVATE_IP="$(read_json_string "${manifest}" cloudflarePrivateIp)"
+    CLOUDFLARE_PRIVATE_SUBNET="$(read_json_string "${manifest}" cloudflareDockerSubnet)"
+
+    validate_cloudflare_identifier "${CLOUDFLARE_TUNNEL_ID}" || die 'Existing Cloudflare Tunnel ID is invalid.'
+    validate_cloudflare_identifier "${CLOUDFLARE_ROUTE_ID}" || die 'Existing Cloudflare route ID is invalid.'
+    validate_hostname "${CLOUDFLARE_TUNNEL_NAME}" || die 'Existing Cloudflare Tunnel name is invalid.'
+    validate_host_ipv4 "${CLOUDFLARE_PRIVATE_IP}" || die 'Existing Cloudflare private IP is invalid.'
+    validate_private_ipv4_cidr "${CLOUDFLARE_PRIVATE_SUBNET}" || die 'Existing Cloudflare Docker subnet is invalid.'
+    [[ "${CLOUDFLARE_PRIVATE_SUBNET##*/}" == 29 ]] || die 'Existing Cloudflare Docker subnet is not a /29.'
+    cidr_is_contained_by "${CLOUDFLARE_PRIVATE_SUBNET}" "${CLOUDFLARE_PRIVATE_CIDR}" ||
+        die 'Existing Cloudflare Docker subnet is outside CLOUDFLARE_PRIVATE_CIDR.'
+    private_integer="$(ipv4_to_integer "${CLOUDFLARE_PRIVATE_IP}")"
+    network_integer="$(ipv4_to_integer "${CLOUDFLARE_PRIVATE_SUBNET%/*}")"
+    (( private_integer == network_integer + 2 )) || die 'Existing Cloudflare desktop IP is not the expected fixed address in its /29.'
+
+    response_file="${CLOUDFLARE_API_WORK_PATH}/response.json"
+    require_cloudflare_api_request 'Existing Cloudflare Tunnel validation' GET "/cfd_tunnel/${CLOUDFLARE_TUNNEL_ID}"
+    python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle).get("result") or {}
+valid = (isinstance(result, dict) and result.get("id") == sys.argv[2]
+         and result.get("name") == sys.argv[3] and not result.get("deleted_at"))
+raise SystemExit(0 if valid else 1)
+' "${response_file}" "${CLOUDFLARE_TUNNEL_ID}" "${CLOUDFLARE_TUNNEL_NAME}" ||
+        die 'The recorded Cloudflare Tunnel is missing, deleted, or no longer matches the manifest.'
+    python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    routes = json.load(handle).get("result") or []
+matches = []
+for route in routes:
+    if not isinstance(route, dict) or route.get("id") != sys.argv[2]:
+        continue
+    tunnel = route.get("tunnel_id", route.get("tunnelId"))
+    if route.get("network") == sys.argv[3] and tunnel == sys.argv[4]:
+        matches.append(route)
+raise SystemExit(0 if len(matches) == 1 else 1)
+' "${CLOUDFLARE_ROUTES_SNAPSHOT}" "${CLOUDFLARE_ROUTE_ID}" \
+        "${CLOUDFLARE_PRIVATE_IP}/32" "${CLOUDFLARE_TUNNEL_ID}" ||
+        die 'The recorded Cloudflare route is missing or no longer maps the private /32 to the recorded Tunnel.'
+
+    [[ -f "${source_token}" && ! -L "${source_token}" && -s "${source_token}" ]] ||
+        die "Existing Cloudflare runtime token is missing or unsafe: ${source_token}"
+    permission="$(stat -c '%a' "${source_token}")"
+    [[ "${permission}" =~ ^(400|444|600)$ ]] ||
+        die "Existing Cloudflare runtime token must have mode 400, 444, or 600: ${source_token}"
+    install -m 0444 -- "${source_token}" "${STAGING_PATH}/${CLOUDFLARE_TUNNEL_TOKEN_FILE}"
+}
+
+recover_stale_cloudflare_api_workspaces() {
+    local stale_path journal account_id route_id tunnel_id creation_started
+    local journal_environment tunnel_name private_ip docker_subnet target_manifest
+    local tunnel_live route_state response_file discovered_route_id
+    local -a stale_paths=()
+
+    shopt -s nullglob
+    stale_paths=("${ROOT_PATH}/.staging/".cloudflare-api.*)
+    shopt -u nullglob
+    for stale_path in "${stale_paths[@]}"; do
+        [[ -d "${stale_path}" && ! -L "${stale_path}" ]] || continue
+        case "${stale_path}" in
+            "${ROOT_PATH}/.staging/.cloudflare-api."*) ;;
+            *) continue ;;
+        esac
+        journal="${stale_path}/created-resources.journal"
+        if [[ ! -f "${journal}" || -L "${journal}" ]]; then
+            CLOUDFLARE_API_WORK_PATH=''
+            die "Stale Cloudflare API workspace has no safe recovery journal: ${stale_path}. Inspect Cloudflare Tunnels/routes manually, then remove this directory."
+        fi
+        account_id="$(read_environment_value "${journal}" accountId || true)"
+        route_id="$(read_environment_value "${journal}" routeId || true)"
+        tunnel_id="$(read_environment_value "${journal}" tunnelId || true)"
+        creation_started="$(read_environment_value "${journal}" tunnelCreationStarted || true)"
+        journal_environment="$(read_environment_value "${journal}" environmentName || true)"
+        tunnel_name="$(read_environment_value "${journal}" tunnelName || true)"
+        private_ip="$(read_environment_value "${journal}" privateIp || true)"
+        docker_subnet="$(read_environment_value "${journal}" dockerSubnet || true)"
+        if [[ "${account_id}" != "${CLOUDFLARE_ACCOUNT_ID}" ]]; then
+            CLOUDFLARE_API_WORK_PATH=''
+            die "Stale Cloudflare journal belongs to another account: ${journal}. Use that account to remove its route then Tunnel, and only then remove the workspace."
+        fi
+        if [[ -n "${route_id}" ]] && ! validate_cloudflare_identifier "${route_id}"; then
+            CLOUDFLARE_API_WORK_PATH=''
+            die "Stale Cloudflare journal contains an invalid route ID: ${journal}. Inspect it manually; the workspace was preserved."
+        fi
+        if [[ -n "${tunnel_id}" ]] && ! validate_cloudflare_identifier "${tunnel_id}"; then
+            CLOUDFLARE_API_WORK_PATH=''
+            die "Stale Cloudflare journal contains an invalid Tunnel ID: ${journal}. Inspect it manually; the workspace was preserved."
+        fi
+        if [[ -n "${journal_environment}" ]] &&
+            { (( ${#journal_environment} > 32 )) || [[ ! "${journal_environment}" =~ ^[a-z][a-z0-9]*(-[a-z0-9]+)*$ ]]; }; then
+            CLOUDFLARE_API_WORK_PATH=''
+            die "Stale Cloudflare journal contains an invalid environment name: ${journal}. The workspace was preserved."
+        fi
+        if [[ -n "${journal_environment}" && "${tunnel_name}" != "dockervm-${journal_environment}" ]]; then
+            CLOUDFLARE_API_WORK_PATH=''
+            die "Stale Cloudflare journal has inconsistent environment/Tunnel ownership: ${journal}. The workspace was preserved."
+        fi
+
+        # A hard stop may occur after the complete staged project is moved into
+        # place but before the API workspace is cleared. Exact manifest ownership
+        # means the resources are committed and must not be deleted.
+        target_manifest="${ROOT_PATH}/${journal_environment}/.environment.json"
+        if [[ -n "${journal_environment}" && -n "${tunnel_id}" && -n "${route_id}" &&
+            -f "${target_manifest}" && ! -L "${target_manifest}" ]] &&
+            python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+expected = {
+    "remoteAccessProvider": "cloudflare",
+    "environmentName": sys.argv[2],
+    "cloudflareAccountId": sys.argv[3],
+    "cloudflareTunnelName": sys.argv[4],
+    "cloudflareTunnelId": sys.argv[5],
+    "cloudflareRouteId": sys.argv[6],
+    "cloudflarePrivateIp": sys.argv[7],
+    "cloudflarePrivateCidr": sys.argv[7] + "/32",
+    "cloudflareDockerSubnet": sys.argv[8],
+}
+valid = isinstance(data, dict) and data.get("schemaVersion", 0) >= 4
+valid = valid and all(data.get(key) == value for key, value in expected.items())
+raise SystemExit(0 if valid else 1)
+' "${target_manifest}" "${journal_environment}" "${account_id}" "${tunnel_name}" \
+                "${tunnel_id}" "${route_id}" "${private_ip}" "${docker_subnet}" 2>/dev/null; then
+            rm -rf -- "${stale_path}"
+            info "Removed a stale API journal for committed environment ${journal_environment}; Cloudflare resources were retained."
+            continue
+        fi
+
+        if [[ "${creation_started}" != 1 && -z "${tunnel_id}" && -z "${route_id}" ]]; then
+            rm -rf -- "${stale_path}"
+            info "Removed an unused stale Cloudflare API workspace: ${stale_path}"
+            continue
+        fi
+        if [[ "${creation_started}" == 1 && -z "${tunnel_id}" ]]; then
+            CLOUDFLARE_API_WORK_PATH=''
+            die "A previous Tunnel POST ended before its ID was journaled: ${journal}. Search Cloudflare for the recorded tunnelName, remove its route then Tunnel if present, and then remove the workspace."
+        fi
+        if ! validate_host_ipv4 "${private_ip}" || ! validate_private_ipv4_cidr "${docker_subnet}" ||
+            [[ "${docker_subnet##*/}" != 29 ]] || ! cidr_is_contained_by "${private_ip}/32" "${docker_subnet}"; then
+            CLOUDFLARE_API_WORK_PATH=''
+            die "Stale Cloudflare journal has invalid private-network ownership data: ${journal}. The workspace was preserved."
+        fi
+
+        CLOUDFLARE_API_WORK_PATH="${stale_path}"
+        response_file="${stale_path}/response.json"
+        tunnel_live='0'
+        if cloudflare_api_request GET "/cfd_tunnel/${tunnel_id}"; then
+            if ! python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle).get("result") or {}
+valid = (isinstance(result, dict) and result.get("id") == sys.argv[2]
+         and result.get("name") == sys.argv[3] and not result.get("deleted_at"))
+raise SystemExit(0 if valid else 1)
+' "${response_file}" "${tunnel_id}" "${tunnel_name}"; then
+                CLOUDFLARE_API_WORK_PATH=''
+                die "Live Tunnel ownership does not match stale journal ${journal}; nothing was deleted."
+            fi
+            tunnel_live='1'
+        elif [[ "${CLOUDFLARE_API_LAST_HTTP_STATUS}" != 404 ]]; then
+            CLOUDFLARE_API_WORK_PATH=''
+            die "Could not verify stale Tunnel ownership for ${journal}; nothing was deleted."
+        fi
+
+        if ! cloudflare_api_request GET '/teamnet/routes?is_deleted=false&per_page=1000'; then
+            CLOUDFLARE_API_WORK_PATH=''
+            die "Could not verify stale route ownership for ${journal}; nothing was deleted."
+        fi
+        route_state="$(python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    routes = json.load(handle).get("result") or []
+wanted_id, network, tunnel_id = sys.argv[2:]
+if wanted_id:
+    by_id = [r for r in routes if isinstance(r, dict) and r.get("id") == wanted_id]
+    if not by_id:
+        print("missing")
+    elif len(by_id) == 1 and by_id[0].get("network") == network and by_id[0].get("tunnel_id", by_id[0].get("tunnelId")) == tunnel_id:
+        print("match:" + wanted_id)
+    else:
+        print("mismatch")
+else:
+    matches = [r.get("id") for r in routes if isinstance(r, dict)
+               and r.get("network") == network
+               and r.get("tunnel_id", r.get("tunnelId")) == tunnel_id
+               and isinstance(r.get("id"), str)]
+    if not matches:
+        print("missing")
+    elif len(matches) == 1:
+        print("match:" + matches[0])
+    else:
+        print("mismatch")
+' "${response_file}" "${route_id}" "${private_ip}/32" "${tunnel_id}")"
+        case "${route_state}" in
+            missing) discovered_route_id='' ;;
+            match:*)
+                discovered_route_id="${route_state#match:}"
+                if ! validate_cloudflare_identifier "${discovered_route_id}"; then
+                    CLOUDFLARE_API_WORK_PATH=''
+                    die "Live route returned an invalid ID while recovering ${journal}; nothing was deleted."
+                fi
+                ;;
+            *)
+                CLOUDFLARE_API_WORK_PATH=''
+                die "Live route ownership does not match stale journal ${journal}; nothing was deleted."
+                ;;
+        esac
+
+        if [[ -n "${discovered_route_id}" ]]; then
+            if ! cloudflare_api_request DELETE "/teamnet/routes/${discovered_route_id}" &&
+                [[ "${CLOUDFLARE_API_LAST_HTTP_STATUS}" != 404 ]]; then
+                CLOUDFLARE_API_WORK_PATH=''
+                die "Could not recover stale Cloudflare route ${discovered_route_id}. The journal is preserved at ${journal}; remove the route then Tunnel manually and retry."
+            fi
+        fi
+        if [[ "${tunnel_live}" == 1 ]]; then
+            if ! cloudflare_api_request DELETE "/cfd_tunnel/${tunnel_id}" &&
+                [[ "${CLOUDFLARE_API_LAST_HTTP_STATUS}" != 404 ]]; then
+                CLOUDFLARE_API_WORK_PATH=''
+                die "Could not recover stale Cloudflare Tunnel ${tunnel_id}. The journal is preserved at ${journal}; remove it manually and retry."
+            fi
+        fi
+        CLOUDFLARE_API_WORK_PATH=''
+        rm -rf -- "${stale_path}"
+        info "Recovered stale Cloudflare provisioning journal: ${journal}"
+    done
+}
+
+prepare_cloudflare_remote_access() {
+    recover_stale_cloudflare_api_workspaces
+    initialize_cloudflare_api_workspace
+    validate_cloudflare_api_access
+    if [[ "${OLD_TARGET_EXISTED}" == 1 ]]; then
+        prepare_existing_cloudflare_remote_access
+    else
+        provision_cloudflare_remote_access
+    fi
+}
+
+rollback_cloudflare_remote_access() {
+    local response_file
+    [[ "${REMOTE_ACCESS_PROVIDER}" == cloudflare ]] || return 0
+    [[ -n "${CLOUDFLARE_API_WORK_PATH}" && -d "${CLOUDFLARE_API_WORK_PATH}" ]] || return 0
+    response_file="${CLOUDFLARE_API_WORK_PATH}/response.json"
+
+    if [[ "${CLOUDFLARE_ROUTE_CREATED}" == 1 && -n "${CLOUDFLARE_ROUTE_ID}" ]]; then
+        if cloudflare_api_request DELETE "/teamnet/routes/${CLOUDFLARE_ROUTE_ID}" ||
+            [[ "${CLOUDFLARE_API_LAST_HTTP_STATUS}" == 404 ]]; then
+            CLOUDFLARE_ROUTE_CREATED='0'
+        else
+            warn "Could not roll back Cloudflare route ${CLOUDFLARE_ROUTE_ID} (${CLOUDFLARE_API_LAST_ERROR})."
+        fi
+    fi
+    [[ "${CLOUDFLARE_ROUTE_CREATED}" != 1 ]] || return 0
+    if [[ "${CLOUDFLARE_TUNNEL_CREATED}" == 1 && -n "${CLOUDFLARE_TUNNEL_ID}" ]]; then
+        if cloudflare_api_request DELETE "/cfd_tunnel/${CLOUDFLARE_TUNNEL_ID}" ||
+            [[ "${CLOUDFLARE_API_LAST_HTTP_STATUS}" == 404 ]]; then
+            CLOUDFLARE_TUNNEL_CREATED='0'
+        else
+            warn "Could not roll back Cloudflare Tunnel ${CLOUDFLARE_TUNNEL_ID} (${CLOUDFLARE_API_LAST_ERROR})."
+        fi
+    fi
+    [[ ! -f "${response_file}" ]] || : >"${response_file}"
 }
 
 remember_allowed_port() {
@@ -685,17 +1470,35 @@ EOF
 
 wait_until_healthy() {
     local project_path="$1"
-    local deadline desktop_id docker_id wireguard_id remote_proxy_id
-    local desktop_state docker_state wireguard_state remote_proxy_state
+    local deadline desktop_id docker_id wireguard_id remote_proxy_id cloudflared_id
+    local desktop_state docker_state wireguard_state remote_proxy_state cloudflared_state
     deadline=$((SECONDS + 600))
     while (( SECONDS < deadline )); do
         desktop_id="$(compose_in "${project_path}" ps -q desktop 2>/dev/null || true)"
         docker_id="$(compose_in "${project_path}" ps -q docker 2>/dev/null || true)"
+        desktop_state=''
+        docker_state=''
+        [[ -z "${desktop_id}" ]] || desktop_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${desktop_id}" 2>/dev/null || true)"
+        [[ -z "${docker_id}" ]] || docker_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${docker_id}" 2>/dev/null || true)"
+
+        if [[ "${REMOTE_ACCESS_PROVIDER}" == cloudflare ]]; then
+            cloudflared_id="$(compose_in "${project_path}" ps -q cloudflared 2>/dev/null || true)"
+            cloudflared_state=''
+            [[ -z "${cloudflared_id}" ]] || cloudflared_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${cloudflared_id}" 2>/dev/null || true)"
+            if [[ "${desktop_state}" == healthy && "${docker_state}" == healthy && "${cloudflared_state}" == healthy ]]; then
+                return 0
+            fi
+            if [[ "${desktop_state}" == unhealthy || "${docker_state}" == unhealthy || "${cloudflared_state}" == unhealthy ]]; then
+                compose_in "${project_path}" logs --tail 100 desktop docker cloudflared >&2 || true
+                die "Environment became unhealthy: desktop=${desktop_state}, docker=${docker_state}, cloudflared=${cloudflared_state}."
+            fi
+            sleep 3
+            continue
+        fi
+
         wireguard_id="$(compose_in "${project_path}" ps -q wireguard 2>/dev/null || true)"
         remote_proxy_id="$(compose_in "${project_path}" ps -q remote_proxy 2>/dev/null || true)"
         if [[ -n "${desktop_id}" && -n "${docker_id}" && -n "${wireguard_id}" && -n "${remote_proxy_id}" ]]; then
-            desktop_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${desktop_id}" 2>/dev/null || true)"
-            docker_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${docker_id}" 2>/dev/null || true)"
             wireguard_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${wireguard_id}" 2>/dev/null || true)"
             remote_proxy_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${remote_proxy_id}" 2>/dev/null || true)"
             if [[ "${desktop_state}" == healthy && "${docker_state}" == healthy && "${wireguard_state}" == healthy && "${remote_proxy_state}" == healthy ]]; then
@@ -708,7 +1511,11 @@ wait_until_healthy() {
         fi
         sleep 3
     done
-    compose_in "${project_path}" logs --tail 100 desktop docker wireguard remote_proxy >&2 || true
+    if [[ "${REMOTE_ACCESS_PROVIDER}" == cloudflare ]]; then
+        compose_in "${project_path}" logs --tail 100 desktop docker cloudflared >&2 || true
+    else
+        compose_in "${project_path}" logs --tail 100 desktop docker wireguard remote_proxy >&2 || true
+    fi
     die "Environment did not become healthy within 600 seconds: ${project_path}"
 }
 
@@ -847,6 +1654,11 @@ on_exit() {
             fi
         fi
 
+        # Cloudflare resources created by this run are external to Docker.
+        # Remove the route first, then its Tunnel, before restoring any prior
+        # local configuration. Existing environments never set these flags.
+        rollback_cloudflare_remote_access
+
         # Keep the restrictive rules in place until the failed containers have
         # stopped, so rollback never creates an unfiltered exposure window.
         if [[ "${failed_environment_stopped}" == 1 && "${FIREWALL_ATTEMPTED}" == 1 && -n "${TARGET_PATH}" && -d "${TARGET_PATH}" ]]; then
@@ -908,6 +1720,24 @@ on_exit() {
             *) warn "Refused to remove unexpected staging path: ${STAGING_PATH}" ;;
         esac
     fi
+    if [[ -n "${CLOUDFLARE_API_WORK_PATH}" && -d "${CLOUDFLARE_API_WORK_PATH}" ]]; then
+        local preserve_unknown_creation='0'
+        local cloudflare_journal="${CLOUDFLARE_API_WORK_PATH}/created-resources.journal"
+        if (( status != 0 )) && [[ -f "${cloudflare_journal}" ]] &&
+            [[ "$(read_environment_value "${cloudflare_journal}" tunnelCreationStarted || true)" == 1 ]] &&
+            [[ -z "$(read_environment_value "${cloudflare_journal}" tunnelId || true)" ]]; then
+            preserve_unknown_creation='1'
+        fi
+        if (( status != 0 )) && { [[ "${CLOUDFLARE_ROUTE_CREATED}" == 1 ]] || [[ "${CLOUDFLARE_TUNNEL_CREATED}" == 1 ]] || [[ "${preserve_unknown_creation}" == 1 ]]; }; then
+            warn "Cloudflare rollback was incomplete; recovery journal preserved at ${CLOUDFLARE_API_WORK_PATH}/created-resources.journal."
+        else
+            case "${CLOUDFLARE_API_WORK_PATH}" in
+                "${ROOT_PATH}/.staging/.cloudflare-api."*) rm -rf -- "${CLOUDFLARE_API_WORK_PATH}" ;;
+                *) warn "Refused to remove unexpected Cloudflare API workspace: ${CLOUDFLARE_API_WORK_PATH}" ;;
+            esac
+        fi
+    fi
+    CLOUDFLARE_API_TOKEN=''
 
     exit "${status}"
 }
@@ -972,7 +1802,7 @@ prepare_ssh_identity() {
     old_public="${TARGET_PATH}/${SSH_PUBLIC_KEY_FILE}"
     staged_private="${STAGING_PATH}/${SSH_PRIVATE_KEY_FILE}"
     staged_public="${STAGING_PATH}/${SSH_PUBLIC_KEY_FILE}"
-    mkdir -p -- "${STAGING_PATH}/secrets"
+    install -d -m 0700 -- "${STAGING_PATH}/secrets"
 
     if [[ "${ROTATE_SSH_KEY}" != 1 && -e "${old_private}" ]]; then
         validate_ssh_private_key "${old_private}" ||
@@ -1039,6 +1869,10 @@ parse_arguments() {
             --rdp-port)
                 require_option_value "$1" "$#"; RDP_PORT="$2"; shift 2 ;;
             --rdp-port=*) RDP_PORT="${1#*=}"; shift ;;
+            --remote-access-provider)
+                require_option_value "$1" "$#"; REMOTE_ACCESS_PROVIDER="${2,,}"; REMOTE_ACCESS_PROVIDER_EXPLICIT='1'; shift 2 ;;
+            --remote-access-provider=*)
+                REMOTE_ACCESS_PROVIDER="${1#*=}"; REMOTE_ACCESS_PROVIDER="${REMOTE_ACCESS_PROVIDER,,}"; REMOTE_ACCESS_PROVIDER_EXPLICIT='1'; shift ;;
             --wireguard-hub-endpoint)
                 require_option_value "$1" "$#"; WIREGUARD_HUB_ENDPOINT="$2"; shift 2 ;;
             --wireguard-hub-endpoint=*) WIREGUARD_HUB_ENDPOINT="${1#*=}"; shift ;;
@@ -1197,60 +2031,64 @@ prepare_inputs() {
     [[ -n "${REMOTE_SUBNET}" ]] || read_with_default REMOTE_SUBNET 'Allowed remote CIDR' "${default_value}"
     validate_cidr "${REMOTE_SUBNET}" || die "Invalid or overly broad CIDR: ${REMOTE_SUBNET}"
 
-    old_value="$(read_environment_value "${old_env}" WIREGUARD_HUB_ENDPOINT || true)"
-    if [[ -z "${WIREGUARD_HUB_ENDPOINT}" ]]; then
-        read_required_with_default WIREGUARD_HUB_ENDPOINT 'Public WireGuard Hub endpoint (IPv4-or-hostname:port)' "${old_value}" '--wireguard-hub-endpoint'
-    fi
-    validate_no_line_breaks 'WireGuard Hub endpoint' "${WIREGUARD_HUB_ENDPOINT}"
-    validate_wireguard_endpoint "${WIREGUARD_HUB_ENDPOINT}" ||
-        die 'WireGuard Hub endpoint must use valid IPv4-or-hostname:port syntax; IPv6 literals are not supported.'
-
-    old_value="$(read_environment_value "${old_env}" WIREGUARD_HUB_PUBLIC_KEY || true)"
-    if [[ -z "${WIREGUARD_HUB_PUBLIC_KEY}" ]]; then
-        read_required_with_default WIREGUARD_HUB_PUBLIC_KEY 'WireGuard Hub public key' "${old_value}" '--wireguard-hub-public-key'
-    fi
-    validate_no_line_breaks 'WireGuard Hub public key' "${WIREGUARD_HUB_PUBLIC_KEY}"
-    validate_wireguard_public_key "${WIREGUARD_HUB_PUBLIC_KEY}" ||
-        die 'WireGuard Hub public key must be a valid, non-zero base64-encoded 32-byte key.'
-
-    old_value="$(read_environment_value "${old_env}" WIREGUARD_ADDRESS || true)"
-    if [[ -z "${WIREGUARD_ADDRESS}" ]]; then
-        if [[ -n "${old_value}" ]]; then
-            default_value="${old_value}"
-        else
-            default_value="$(select_default_wireguard_address)" ||
-                die 'No unused default WireGuard address remains in 10.200.0.10-10.200.0.254.'
+    if [[ "${REMOTE_ACCESS_PROVIDER}" == wireguard ]]; then
+        old_value="$(read_environment_value "${old_env}" WIREGUARD_HUB_ENDPOINT || true)"
+        if [[ -z "${WIREGUARD_HUB_ENDPOINT}" ]]; then
+            read_required_with_default WIREGUARD_HUB_ENDPOINT 'Public WireGuard Hub endpoint (IPv4-or-hostname:port)' "${old_value}" '--wireguard-hub-endpoint'
         fi
-        read_with_default WIREGUARD_ADDRESS 'WireGuard environment IPv4/CIDR' "${default_value}"
-    fi
-    validate_wireguard_address "${WIREGUARD_ADDRESS}" ||
-        die 'WireGuard address must be a usable IPv4 host address with a /8 through /29 prefix.'
-    WIREGUARD_ADDRESS="$(canonicalize_wireguard_address "${WIREGUARD_ADDRESS}")" ||
-        die 'Could not canonicalize the validated WireGuard address.'
-    WIREGUARD_IP="${WIREGUARD_ADDRESS%/*}"
-    if wireguard_ip_in_use "${WIREGUARD_IP}"; then
-        die "WireGuard IP ${WIREGUARD_IP} is already assigned to another environment under ${ROOT_PATH}."
-    fi
-    WIREGUARD_NETWORK="$(network_cidr "${WIREGUARD_IP}" "$((10#${WIREGUARD_ADDRESS##*/}))")"
-    if cidr_ranges_overlap "${REMOTE_SUBNET}" "${WIREGUARD_NETWORK}"; then
-        die "WireGuard network ${WIREGUARD_NETWORK} overlaps the LAN remote subnet ${REMOTE_SUBNET}."
-    fi
+        validate_no_line_breaks 'WireGuard Hub endpoint' "${WIREGUARD_HUB_ENDPOINT}"
+        validate_wireguard_endpoint "${WIREGUARD_HUB_ENDPOINT}" ||
+            die 'WireGuard Hub endpoint must use valid IPv4-or-hostname:port syntax; IPv6 literals are not supported.'
 
-    old_value="$(read_environment_value "${old_env}" WIREGUARD_MTU || true)"
-    default_value="${old_value:-1380}"
-    [[ -n "${WIREGUARD_MTU}" ]] || read_with_default WIREGUARD_MTU 'WireGuard MTU' "${default_value}"
-    [[ "${WIREGUARD_MTU}" =~ ^[0-9]{1,5}$ ]] || die 'WireGuard MTU must be an integer from 1280 through 1420.'
-    WIREGUARD_MTU=$((10#${WIREGUARD_MTU}))
-    (( WIREGUARD_MTU >= 1280 && WIREGUARD_MTU <= 1420 )) ||
-        die 'WireGuard MTU must be an integer from 1280 through 1420.'
+        old_value="$(read_environment_value "${old_env}" WIREGUARD_HUB_PUBLIC_KEY || true)"
+        if [[ -z "${WIREGUARD_HUB_PUBLIC_KEY}" ]]; then
+            read_required_with_default WIREGUARD_HUB_PUBLIC_KEY 'WireGuard Hub public key' "${old_value}" '--wireguard-hub-public-key'
+        fi
+        validate_no_line_breaks 'WireGuard Hub public key' "${WIREGUARD_HUB_PUBLIC_KEY}"
+        validate_wireguard_public_key "${WIREGUARD_HUB_PUBLIC_KEY}" ||
+            die 'WireGuard Hub public key must be a valid, non-zero base64-encoded 32-byte key.'
 
-    old_value="$(read_environment_value "${old_env}" WIREGUARD_KEEPALIVE || true)"
-    default_value="${old_value:-25}"
-    [[ -n "${WIREGUARD_KEEPALIVE}" ]] || read_with_default WIREGUARD_KEEPALIVE 'WireGuard persistent keepalive seconds' "${default_value}"
-    [[ "${WIREGUARD_KEEPALIVE}" =~ ^[0-9]{1,5}$ ]] || die 'WireGuard keepalive must be an integer from 0 through 65535.'
-    WIREGUARD_KEEPALIVE=$((10#${WIREGUARD_KEEPALIVE}))
-    (( WIREGUARD_KEEPALIVE >= 0 && WIREGUARD_KEEPALIVE <= 65535 )) ||
-        die 'WireGuard keepalive must be an integer from 0 through 65535.'
+        old_value="$(read_environment_value "${old_env}" WIREGUARD_ADDRESS || true)"
+        if [[ -z "${WIREGUARD_ADDRESS}" ]]; then
+            if [[ -n "${old_value}" ]]; then
+                default_value="${old_value}"
+            else
+                default_value="$(select_default_wireguard_address)" ||
+                    die 'No unused default WireGuard address remains in 10.200.0.10-10.200.0.254.'
+            fi
+            read_with_default WIREGUARD_ADDRESS 'WireGuard environment IPv4/CIDR' "${default_value}"
+        fi
+        validate_wireguard_address "${WIREGUARD_ADDRESS}" ||
+            die 'WireGuard address must be a usable IPv4 host address with a /8 through /29 prefix.'
+        WIREGUARD_ADDRESS="$(canonicalize_wireguard_address "${WIREGUARD_ADDRESS}")" ||
+            die 'Could not canonicalize the validated WireGuard address.'
+        WIREGUARD_IP="${WIREGUARD_ADDRESS%/*}"
+        if wireguard_ip_in_use "${WIREGUARD_IP}"; then
+            die "WireGuard IP ${WIREGUARD_IP} is already assigned to another environment under ${ROOT_PATH}."
+        fi
+        WIREGUARD_NETWORK="$(network_cidr "${WIREGUARD_IP}" "$((10#${WIREGUARD_ADDRESS##*/}))")"
+        if cidr_ranges_overlap "${REMOTE_SUBNET}" "${WIREGUARD_NETWORK}"; then
+            die "WireGuard network ${WIREGUARD_NETWORK} overlaps the LAN remote subnet ${REMOTE_SUBNET}."
+        fi
+
+        old_value="$(read_environment_value "${old_env}" WIREGUARD_MTU || true)"
+        default_value="${old_value:-1380}"
+        [[ -n "${WIREGUARD_MTU}" ]] || read_with_default WIREGUARD_MTU 'WireGuard MTU' "${default_value}"
+        [[ "${WIREGUARD_MTU}" =~ ^[0-9]{1,5}$ ]] || die 'WireGuard MTU must be an integer from 1280 through 1420.'
+        WIREGUARD_MTU=$((10#${WIREGUARD_MTU}))
+        (( WIREGUARD_MTU >= 1280 && WIREGUARD_MTU <= 1420 )) ||
+            die 'WireGuard MTU must be an integer from 1280 through 1420.'
+
+        old_value="$(read_environment_value "${old_env}" WIREGUARD_KEEPALIVE || true)"
+        default_value="${old_value:-25}"
+        [[ -n "${WIREGUARD_KEEPALIVE}" ]] || read_with_default WIREGUARD_KEEPALIVE 'WireGuard persistent keepalive seconds' "${default_value}"
+        [[ "${WIREGUARD_KEEPALIVE}" =~ ^[0-9]{1,5}$ ]] || die 'WireGuard keepalive must be an integer from 0 through 65535.'
+        WIREGUARD_KEEPALIVE=$((10#${WIREGUARD_KEEPALIVE}))
+        (( WIREGUARD_KEEPALIVE >= 0 && WIREGUARD_KEEPALIVE <= 65535 )) ||
+            die 'WireGuard keepalive must be an integer from 0 through 65535.'
+    else
+        load_cloudflare_config
+    fi
 
     collect_existing_environment_ports "${old_env}"
     if [[ "${SSH_PORT}" == 0 ]]; then
@@ -1400,6 +2238,9 @@ write_environment_files() {
     local desktop_cpu_display desktop_memory_display dind_cpu_display dind_memory_display
     local desktop_cpus_unlimited desktop_memory_unlimited dind_cpus_unlimited dind_memory_unlimited
     local local_rdp_file remote_rdp_file wireguard_public_key_file wireguard_hub_peer_file wireguard_state_volume
+    local remote_private_ip remote_access_services desktop_remote_networks remote_access_secrets
+    local remote_access_volumes remote_access_networks remote_access_summary remote_connection_rows
+    local remote_access_instructions remote_data_warning remote_access_manifest_fields services_template
     image_tag="26.04-$(date -u +%Y%m%d%H%M%S)-$(random_suffix)"
     storage_env="$(env_single_quoted "${STORAGE_PATH}")"
     chain_prefix="${ENVIRONMENT_NAME//-/_}"
@@ -1449,6 +2290,106 @@ write_environment_files() {
         dind_memory_unlimited='true'
     fi
 
+    services_template="${STAGING_PATH}/compose.${REMOTE_ACCESS_PROVIDER}.services.template"
+    [[ -f "${services_template}" && ! -L "${services_template}" ]] ||
+        die "Remote-access service template is missing or unsafe: ${services_template}"
+    remote_access_services="$(<"${services_template}")"
+    remote_access_secrets=''
+    remote_access_volumes=''
+
+    if [[ "${REMOTE_ACCESS_PROVIDER}" == cloudflare ]]; then
+        remote_private_ip="${CLOUDFLARE_PRIVATE_IP}"
+        printf -v desktop_remote_networks '%s\n%s' \
+            '      remote_access:' \
+            '        ipv4_address: ${CLOUDFLARE_PRIVATE_IP}'
+        printf -v remote_access_secrets '%s\n%s' \
+            '  cloudflared_token:' \
+            '    file: ./secrets/cloudflared_tunnel_token'
+        printf -v remote_access_networks '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+            '  remote_access:' \
+            '    name: ${ENVIRONMENT_NAME}_remote_access' \
+            '    internal: true' \
+            '    ipam:' \
+            '      config:' \
+            '        - subnet: ${CLOUDFLARE_PRIVATE_SUBNET}' \
+            '  cloudflare_egress:' \
+            '    name: ${ENVIRONMENT_NAME}_cloudflare_egress'
+        remote_access_summary='Cloudflare Zero Trust remote access'
+        printf -v remote_connection_rows '%s\n%s' \
+            "| Remote SSH | \`${CLOUDFLARE_PRIVATE_IP}:22\` | \`ssh -o IdentitiesOnly=yes -i \"${SSH_PRIVATE_KEY_FILE}\" ${ACCOUNT_NAME}@${CLOUDFLARE_PRIVATE_IP}\` |" \
+            "| Remote RDP | \`${CLOUDFLARE_PRIVATE_IP}:3389\` | \`${remote_rdp_file}\` |"
+        printf -v remote_access_instructions '%s\n\n%s\n\n%s\n\n%s\n%s\n\n%s\n\n%s\n\n%s\n%s' \
+            '## Connect through Cloudflare Zero Trust' \
+            "Enroll the remote device in the Cloudflare One Client (WARP) team \`${CLOUDFLARE_TEAM_NAME}\`, enable WARP, and make sure the Zero Trust split-tunnel and Gateway policies route and allow \`${CLOUDFLARE_PRIVATE_IP}/32\` on TCP ports \`22\` and \`3389\`." \
+            "This environment owns Tunnel \`${CLOUDFLARE_TUNNEL_ID}\` and private-route \`${CLOUDFLARE_ROUTE_ID}\`. The connector reaches the desktop only on its dedicated Docker network." \
+            'Check connector state and logs with:' \
+            '```bash' \
+            'docker compose ps cloudflared' \
+            'docker compose logs --tail 100 cloudflared' \
+            '```' \
+            'Keep `secrets/cloudflared_tunnel_token` private. The repository management API token is not copied into this environment.'
+        remote_data_warning='Do not run `docker compose down -v`; it deletes DinD data and SSH host keys. The tunnel token is host-protected by the `secrets` directory and read-only inside the connector.'
+        printf -v remote_access_manifest_fields '%s\n' \
+            '  "wireguardRequired": false,' \
+            "  \"cloudflareAccountId\": \"${CLOUDFLARE_ACCOUNT_ID}\"," \
+            "  \"cloudflareTeamName\": \"$(json_escape "${CLOUDFLARE_TEAM_NAME}")\"," \
+            "  \"cloudflareTunnelName\": \"$(json_escape "${CLOUDFLARE_TUNNEL_NAME}")\"," \
+            "  \"cloudflareTunnelId\": \"${CLOUDFLARE_TUNNEL_ID}\"," \
+            "  \"cloudflareRouteId\": \"${CLOUDFLARE_ROUTE_ID}\"," \
+            "  \"cloudflarePrivateIp\": \"${CLOUDFLARE_PRIVATE_IP}\"," \
+            "  \"cloudflarePrivateCidr\": \"${CLOUDFLARE_PRIVATE_IP}/32\"," \
+            "  \"cloudflareDockerSubnet\": \"${CLOUDFLARE_PRIVATE_SUBNET}\"," \
+            "  \"cloudflareTunnelTokenFile\": \"${CLOUDFLARE_TUNNEL_TOKEN_FILE}\"," \
+            '  "cloudflareProvisioningStatus": "active",'
+        remote_access_manifest_fields="${remote_access_manifest_fields%$'\n'}"
+    else
+        remote_private_ip="${WIREGUARD_IP}"
+        desktop_remote_networks='      remote_access: {}'
+        printf -v remote_access_volumes '%s\n%s' \
+            '  wireguard_state:' \
+            '    name: ${ENVIRONMENT_NAME}_wireguard_state'
+        printf -v remote_access_networks '%s\n%s\n%s\n%s\n%s' \
+            '  remote_access:' \
+            '    name: ${ENVIRONMENT_NAME}_remote_access' \
+            '    internal: true' \
+            '  wireguard_transport:' \
+            '    name: ${ENVIRONMENT_NAME}_wireguard_transport'
+        remote_access_summary='WireGuard remote access'
+        printf -v remote_connection_rows '%s\n%s' \
+            "| Remote SSH | \`${WIREGUARD_IP}:22\` | \`ssh -o IdentitiesOnly=yes -i \"${SSH_PRIVATE_KEY_FILE}\" ${ACCOUNT_NAME}@${WIREGUARD_IP}\` |" \
+            "| Remote RDP | \`${WIREGUARD_IP}:3389\` | \`${remote_rdp_file}\` |"
+        printf -v remote_access_instructions '%s\n\n%s\n\n%s\n\n%s\n%s\n%s\n\n%s\n\n%s\n\n%s\n%s\n%s\n%s\n%s\n\n%s\n\n%s' \
+            'For remote access, connect the client device to the same WireGuard Hub before using the remote SSH command or RDP file.' \
+            '## Register with the WireGuard Hub' \
+            "- Environment address: \`${WIREGUARD_ADDRESS}\`" \
+            "- VPN network: \`${WIREGUARD_NETWORK}\`" \
+            "- Hub endpoint: \`${WIREGUARD_HUB_ENDPOINT}\`" \
+            'After the first `docker compose up -d`, add this generated peer block to the Hub and reload its configuration:' \
+            "\`${wireguard_hub_peer_file}\`" \
+            'If the files are missing, export the public data again:' \
+            '```bash' \
+            "docker compose cp wireguard:/var/lib/wireguard/public.key ${wireguard_public_key_file}" \
+            "docker compose cp wireguard:/var/lib/wireguard/hub_peer.conf ${wireguard_hub_peer_file}" \
+            '```' \
+            "The Hub must forward authorized client peers to \`${WIREGUARD_IP}/32\` on TCP ports \`22\` and \`3389\`. The environment private key stays in Docker volume \`${wireguard_state_volume}\`." \
+            'Keep this `/32` unique across every Docker host attached to the Hub. Remove the Hub peer when this environment is deleted.'
+        remote_data_warning='Do not run `docker compose down -v`; it deletes DinD data, SSH host keys, and the WireGuard identity.'
+        printf -v remote_access_manifest_fields '%s\n' \
+            '  "wireguardRequired": true,' \
+            "  \"wireguardAddress\": \"${WIREGUARD_ADDRESS}\"," \
+            "  \"wireguardIp\": \"${WIREGUARD_IP}\"," \
+            "  \"wireguardNetwork\": \"${WIREGUARD_NETWORK}\"," \
+            "  \"wireguardHubEndpoint\": \"$(json_escape "${WIREGUARD_HUB_ENDPOINT}")\"," \
+            "  \"wireguardHubPublicKey\": \"${WIREGUARD_HUB_PUBLIC_KEY}\"," \
+            "  \"wireguardMtu\": ${WIREGUARD_MTU}," \
+            "  \"wireguardKeepalive\": ${WIREGUARD_KEEPALIVE}," \
+            "  \"wireguardPublicKeyFile\": \"${wireguard_public_key_file}\"," \
+            "  \"wireguardHubPeerFile\": \"${wireguard_hub_peer_file}\"," \
+            "  \"wireguardStateVolume\": \"${wireguard_state_volume}\"," \
+            '  "wireguardKeyGeneratedOnFirstStart": true,'
+        remote_access_manifest_fields="${remote_access_manifest_fields%$'\n'}"
+    fi
+
     cat >"${STAGING_PATH}/.env" <<EOF
 ENVIRONMENT_NAME=${ENVIRONMENT_NAME}
 ACCOUNT_NAME=${ACCOUNT_NAME}
@@ -1458,12 +2399,7 @@ HOST_ADDRESS=${HOST_ADDRESS}
 SSH_PORT=${SSH_PORT}
 RDP_PORT=${RDP_PORT}
 REMOTE_SUBNET=${REMOTE_SUBNET}
-WIREGUARD_HUB_ENDPOINT=${WIREGUARD_HUB_ENDPOINT}
-WIREGUARD_HUB_PUBLIC_KEY=${WIREGUARD_HUB_PUBLIC_KEY}
-WIREGUARD_ADDRESS=${WIREGUARD_ADDRESS}
-WIREGUARD_NETWORK=${WIREGUARD_NETWORK}
-WIREGUARD_MTU=${WIREGUARD_MTU}
-WIREGUARD_KEEPALIVE=${WIREGUARD_KEEPALIVE}
+REMOTE_ACCESS_PROVIDER=${REMOTE_ACCESS_PROVIDER}
 # A resource value of -1 means unlimited; the corresponding Compose limit is omitted.
 DESKTOP_CPUS=${DESKTOP_CPUS}
 DESKTOP_MEMORY=${DESKTOP_MEMORY}
@@ -1478,6 +2414,22 @@ CUDA_IMAGE=${CUDA_IMAGE}
 NVIDIA_CONTAINER_TOOLKIT_VERSION=${NVIDIA_CONTAINER_TOOLKIT_VERSION}
 STORAGE_ROOT=${storage_env}
 EOF
+    if [[ "${REMOTE_ACCESS_PROVIDER}" == cloudflare ]]; then
+        cat >>"${STAGING_PATH}/.env" <<EOF
+CLOUDFLARE_TEAM_NAME=${CLOUDFLARE_TEAM_NAME}
+CLOUDFLARE_PRIVATE_IP=${CLOUDFLARE_PRIVATE_IP}
+CLOUDFLARE_PRIVATE_SUBNET=${CLOUDFLARE_PRIVATE_SUBNET}
+EOF
+    else
+        cat >>"${STAGING_PATH}/.env" <<EOF
+WIREGUARD_HUB_ENDPOINT=${WIREGUARD_HUB_ENDPOINT}
+WIREGUARD_HUB_PUBLIC_KEY=${WIREGUARD_HUB_PUBLIC_KEY}
+WIREGUARD_ADDRESS=${WIREGUARD_ADDRESS}
+WIREGUARD_NETWORK=${WIREGUARD_NETWORK}
+WIREGUARD_MTU=${WIREGUARD_MTU}
+WIREGUARD_KEEPALIVE=${WIREGUARD_KEEPALIVE}
+EOF
+    fi
     chmod 0600 "${STAGING_PATH}/.env"
 
     mkdir -p -- "${STAGING_PATH}/secrets"
@@ -1529,13 +2481,22 @@ EOF
         [GPU_STATUS]="${gpu_status}"
         [CUDA_IMAGE]="${CUDA_IMAGE}"
         [GPU_TEST_COMMAND]="${gpu_test_command}"
+        [DESKTOP_REMOTE_NETWORKS]="${desktop_remote_networks}"
+        [REMOTE_ACCESS_SERVICES]="${remote_access_services}"
+        [REMOTE_ACCESS_SECRETS]="${remote_access_secrets}"
+        [REMOTE_ACCESS_VOLUMES]="${remote_access_volumes}"
+        [REMOTE_ACCESS_NETWORKS]="${remote_access_networks}"
+        [REMOTE_ACCESS_SUMMARY]="${remote_access_summary}"
+        [REMOTE_CONNECTION_ROWS]="${remote_connection_rows}"
+        [REMOTE_ACCESS_INSTRUCTIONS]="${remote_access_instructions}"
+        [REMOTE_DATA_WARNING]="${remote_data_warning}"
     )
 
     expand_template "${STAGING_PATH}/compose.yaml.template" "${STAGING_PATH}/compose.yaml"
     chmod 0644 "${STAGING_PATH}/compose.yaml"
     expand_template "${STAGING_PATH}/README.md.template" "${STAGING_PATH}/README.md"
     expand_template "${STAGING_PATH}/environment_VM.rdp.template" "${STAGING_PATH}/${local_rdp_file}"
-    TEMPLATE_TOKENS[RDP_FULL_ADDRESS]="${WIREGUARD_IP}:3389"
+    TEMPLATE_TOKENS[RDP_FULL_ADDRESS]="${remote_private_ip}:3389"
     expand_template "${STAGING_PATH}/environment_VM.rdp.template" "${STAGING_PATH}/${remote_rdp_file}"
     TEMPLATE_TOKENS[RDP_FULL_ADDRESS]="${HOST_ADDRESS}:${RDP_PORT}"
     expand_template "${STAGING_PATH}/configure_firewall.sh.template" "${STAGING_PATH}/configure_${ENVIRONMENT_NAME_SNAKE}_firewall.sh"
@@ -1554,12 +2515,14 @@ EOF
         "${STAGING_PATH}/configure_firewall.sh.template" \
         "${STAGING_PATH}/ConfigureFirewall.ps1.template" \
         "${STAGING_PATH}/compose.gpu.yaml.template" \
+        "${STAGING_PATH}/compose.cloudflare.services.template" \
+        "${STAGING_PATH}/compose.wireguard.services.template" \
         "${STAGING_PATH}/test_gpu.sh.template" \
         "${STAGING_PATH}/TestGpu.ps1.template"
 
     cat >"${STAGING_PATH}/.environment.json" <<EOF
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "generator": "${SCRIPT_NAME}",
   "generatedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "hostOs": "linux",
@@ -1580,18 +2543,8 @@ EOF
   "localRdpFile": "$(json_escape "${local_rdp_file}")",
   "remoteRdpFile": "$(json_escape "${remote_rdp_file}")",
   "hostPort3389Reserved": true,
-  "wireguardRequired": true,
-  "wireguardAddress": "${WIREGUARD_ADDRESS}",
-  "wireguardIp": "${WIREGUARD_IP}",
-  "wireguardNetwork": "${WIREGUARD_NETWORK}",
-  "wireguardHubEndpoint": "$(json_escape "${WIREGUARD_HUB_ENDPOINT}")",
-  "wireguardHubPublicKey": "${WIREGUARD_HUB_PUBLIC_KEY}",
-  "wireguardMtu": ${WIREGUARD_MTU},
-  "wireguardKeepalive": ${WIREGUARD_KEEPALIVE},
-  "wireguardPublicKeyFile": "${wireguard_public_key_file}",
-  "wireguardHubPeerFile": "${wireguard_hub_peer_file}",
-  "wireguardStateVolume": "${wireguard_state_volume}",
-  "wireguardKeyGeneratedOnFirstStart": true,
+  "remoteAccessProvider": "${REMOTE_ACCESS_PROVIDER}",
+${remote_access_manifest_fields}
   "desktopCpus": ${DESKTOP_CPUS},
   "desktopCpusUnlimited": ${desktop_cpus_unlimited},
   "desktopMemory": "${DESKTOP_MEMORY}",
@@ -1655,15 +2608,21 @@ perform_legacy_migration() {
 }
 
 build_images() {
-    info 'Building desktop, DinD, and WireGuard images ...'
+    local -a services=(desktop docker)
+    if [[ "${REMOTE_ACCESS_PROVIDER}" == wireguard ]]; then
+        services+=(wireguard)
+        info 'Building desktop, DinD, and WireGuard images ...'
+    else
+        info 'Building desktop and DinD images ...'
+    fi
     if [[ "${USE_BUILDKIT}" == 1 ]]; then
         (
             export DOCKER_BUILDKIT=1
             export COMPOSE_DOCKER_CLI_BUILD=1
-            compose_in "${STAGING_PATH}" build desktop docker wireguard
+            compose_in "${STAGING_PATH}" build "${services[@]}"
         )
     else
-        compose_in "${STAGING_PATH}" build desktop docker wireguard
+        compose_in "${STAGING_PATH}" build "${services[@]}"
     fi
 }
 
@@ -1712,6 +2671,13 @@ main() {
     fi
     [[ -d "${TARGET_PATH}" ]] && OLD_TARGET_EXISTED='1'
     old_env="${TARGET_PATH}/.env"
+    select_remote_access_provider
+    if [[ "${REMOTE_ACCESS_PROVIDER}" == cloudflare ]]; then
+        for command_name in curl python3; do
+            command -v "${command_name}" >/dev/null 2>&1 ||
+                die "Cloudflare provisioning requires the host command: ${command_name}"
+        done
+    fi
 
     STORAGE_PATH="${ROOT_PATH}/mount/${ENVIRONMENT_NAME}"
     HOME_STORAGE_PATH="${STORAGE_PATH}/home"
@@ -1730,8 +2696,13 @@ main() {
     STAGING_PATH="${ROOT_PATH}/.staging/${ENVIRONMENT_NAME}.$(random_suffix)"
     mkdir -p -- "${STAGING_PATH}"
     cp -a -- "${TEMPLATE_PATH}/." "${STAGING_PATH}/"
-    install -d -m 0700 "${STAGING_PATH}/wireguard"
+    if [[ "${REMOTE_ACCESS_PROVIDER}" == wireguard ]]; then
+        install -d -m 0700 "${STAGING_PATH}/wireguard"
+    fi
     prepare_ssh_identity
+    if [[ "${REMOTE_ACCESS_PROVIDER}" == cloudflare ]]; then
+        prepare_cloudflare_remote_access
+    fi
     write_environment_files
 
     compose_in "${STAGING_PATH}" config --quiet
@@ -1790,7 +2761,9 @@ main() {
     compose_in "${TARGET_PATH}" up -d
     NEW_STARTED='1'
     wait_until_healthy "${TARGET_PATH}"
-    export_wireguard_outputs "${TARGET_PATH}"
+    if [[ "${REMOTE_ACCESS_PROVIDER}" == wireguard ]]; then
+        export_wireguard_outputs "${TARGET_PATH}"
+    fi
 
     if [[ "${GPU_ENABLED}" == 1 ]]; then
         info 'Running direct and nested GPU verification ...'
@@ -1804,13 +2777,23 @@ main() {
     info "Persistent home: ${HOME_STORAGE_PATH}"
     info "Persistent workspace: ${WORKSPACE_STORAGE_PATH}"
     info "Local SSH: ssh -o IdentitiesOnly=yes -i $(single_quote_shell_value "${TARGET_PATH}/${SSH_PRIVATE_KEY_FILE}") -p ${SSH_PORT} ${ACCOUNT_NAME}@${HOST_ADDRESS}"
-    info "Remote SSH: ssh -o IdentitiesOnly=yes -i $(single_quote_shell_value "${TARGET_PATH}/${SSH_PRIVATE_KEY_FILE}") ${ACCOUNT_NAME}@${WIREGUARD_IP}"
+    if [[ "${REMOTE_ACCESS_PROVIDER}" == cloudflare ]]; then
+        info "Remote SSH (WARP): ssh -o IdentitiesOnly=yes -i $(single_quote_shell_value "${TARGET_PATH}/${SSH_PRIVATE_KEY_FILE}") ${ACCOUNT_NAME}@${CLOUDFLARE_PRIVATE_IP}"
+    else
+        info "Remote SSH: ssh -o IdentitiesOnly=yes -i $(single_quote_shell_value "${TARGET_PATH}/${SSH_PRIVATE_KEY_FILE}") ${ACCOUNT_NAME}@${WIREGUARD_IP}"
+    fi
     info "SSH public key: ${TARGET_PATH}/${SSH_PUBLIC_KEY_FILE} (${SSH_KEY_FINGERPRINT})"
     info "Local RDP file: ${TARGET_PATH}/${ENVIRONMENT_NAME}_local.rdp"
     info "Remote RDP file: ${TARGET_PATH}/${ENVIRONMENT_NAME}_remote.rdp"
-    info "WireGuard: ${WIREGUARD_ADDRESS} via ${WIREGUARD_HUB_ENDPOINT}"
-    info "WireGuard public key: ${TARGET_PATH}/wireguard/${ENVIRONMENT_NAME}_wireguard_public.key"
-    info "Hub peer config: ${TARGET_PATH}/wireguard/${ENVIRONMENT_NAME}_hub_peer.conf"
+    if [[ "${REMOTE_ACCESS_PROVIDER}" == cloudflare ]]; then
+        info "Cloudflare Zero Trust: ${CLOUDFLARE_PRIVATE_IP}/32 (team ${CLOUDFLARE_TEAM_NAME})"
+        info "Cloudflare Tunnel ID: ${CLOUDFLARE_TUNNEL_ID}"
+        info "Cloudflare route ID: ${CLOUDFLARE_ROUTE_ID}"
+    else
+        info "WireGuard: ${WIREGUARD_ADDRESS} via ${WIREGUARD_HUB_ENDPOINT}"
+        info "WireGuard public key: ${TARGET_PATH}/wireguard/${ENVIRONMENT_NAME}_wireguard_public.key"
+        info "Hub peer config: ${TARGET_PATH}/wireguard/${ENVIRONMENT_NAME}_hub_peer.conf"
+    fi
     info "Resources: desktop=$(resource_display_value "${DESKTOP_CPUS}") CPU/$(resource_display_value "${DESKTOP_MEMORY}"), DinD=$(resource_display_value "${DIND_CPUS}") CPU/$(resource_display_value "${DIND_MEMORY}")"
     info "GPU: $([[ "${GPU_ENABLED}" == 1 ]] && printf 'enabled (%s)' "${CUDA_IMAGE}" || printf 'disabled')"
     [[ -z "${BACKUP_PATH}" ]] || info "Previous configuration backup: ${BACKUP_PATH}"

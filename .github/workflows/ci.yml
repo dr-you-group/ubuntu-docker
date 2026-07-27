@@ -22,7 +22,7 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-      - name: Install ShellCheck
+      - name: Install Linux test tools
         run: |
           if ! command -v shellcheck >/dev/null 2>&1; then
             sudo apt-get update
@@ -30,6 +30,10 @@ jobs:
           fi
       - name: Run Linux tests
         run: bash tests/test_project.sh
+      - name: Test Cloudflare API contract without credentials or network calls
+        run: bash tests/test_cloudflare_api_mock.sh
+      - name: Render Cloudflare environment with fake API and verify rollback
+        run: bash tests/test_cloudflare_generator_smoke.sh
 
   windows-static:
     name: Windows static and unit tests

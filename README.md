@@ -19,6 +19,8 @@ Create Ubuntu 26.04 desktop environments with RDP, key-only SSH, persistent stor
    - `Cloudflare One Networks` — Write
 5. Copy `.env.example` to `.env` and fill in its four values. Do not quote, commit, or share the token.
 
+Both permissions must be **Write**, and the token's Account Resources scope must include the same account identified by `CLOUDFLARE_ACCOUNT_ID`. A read-only token can list tunnels but receives HTTP `403` when the generator tries to create one.
+
 On Ubuntu, protect the configuration before running the generator:
 
 ```bash

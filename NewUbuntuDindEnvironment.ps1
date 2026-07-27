@@ -692,6 +692,48 @@ function Get-CloudflarePrivateAllocation {
     throw "No non-overlapping /29 remains in the Cloudflare private pool: $PoolCidr"
 }
 
+function Get-CloudflareNumericErrorCodes {
+    param([AllowNull()] [object]$Envelope)
+
+    $codes = [Collections.Generic.List[string]]::new()
+    foreach ($apiError in @(Get-ObjectPropertyValue -Object $Envelope -Name 'errors' -Default @())) {
+        $candidate = Get-ObjectPropertyValue -Object $apiError -Name 'code' -Default $null
+        $parsed = [long]0
+        if ($null -ne $candidate -and
+            [long]::TryParse([string]$candidate, [ref]$parsed) -and
+            $parsed -ge 0) {
+            $codes.Add([string]$parsed)
+        }
+    }
+    return @($codes | Sort-Object -Unique)
+}
+
+function New-CloudflareApiException {
+    param(
+        [Parameter(Mandatory)] [string]$Summary,
+        [AllowNull()] [object]$HttpStatus = $null,
+        [string[]]$ErrorCodes = @(),
+        [bool]$PostOutcomeAmbiguous = $false
+    )
+
+    $statusSummary = if ($null -eq $HttpStatus) { 'unavailable' } else { [string]$HttpStatus }
+    $codeSummary = if ($ErrorCodes.Count -gt 0) {
+        ", error codes: $($ErrorCodes -join ',')"
+    }
+    else { '' }
+    $message = "$Summary (HTTP $statusSummary$codeSummary)."
+    $exception = [InvalidOperationException]::new($message)
+    $exception.Data['CloudflareApiFailure'] = $true
+    if ($null -ne $HttpStatus -and [string]$HttpStatus -match '^\d{3}$') {
+        $exception.Data['CloudflareHttpStatus'] = [int]$HttpStatus
+    }
+    if ($ErrorCodes.Count -gt 0) {
+        $exception.Data['CloudflareErrorCodes'] = $ErrorCodes -join ','
+    }
+    $exception.Data['CloudflarePostOutcomeAmbiguous'] = $PostOutcomeAmbiguous
+    return $exception
+}
+
 function Invoke-CloudflareApi {
     param(
         [Parameter(Mandatory)] [ValidateSet('GET', 'POST', 'DELETE')] [string]$Method,
@@ -703,9 +745,13 @@ function Invoke-CloudflareApi {
     $request = @{
         Uri = "https://api.cloudflare.com/client/v4$Path"
         Method = $Method
-        Headers = @{ Authorization = "Bearer $ApiToken" }
+        Headers = @{
+            Authorization = "Bearer $ApiToken"
+            Accept = 'application/json'
+        }
         ErrorAction = 'Stop'
         UseBasicParsing = $true
+        TimeoutSec = 90
     }
     if ($null -ne $Body) {
         $request['ContentType'] = 'application/json'
@@ -715,20 +761,58 @@ function Invoke-CloudflareApi {
         $response = Invoke-RestMethod @request
     }
     catch {
-        $statusCode = 'unavailable'
-        try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
-        throw "Cloudflare API request failed ($Method $Path, HTTP $statusCode). Check the scoped API token and account configuration."
+        $requestFailure = $_
+        $statusCode = $null
+        try {
+            $responseProperty = $requestFailure.Exception.PSObject.Properties['Response']
+            if ($null -ne $responseProperty -and $null -ne $responseProperty.Value) {
+                $statusProperty = $responseProperty.Value.PSObject.Properties['StatusCode']
+                if ($null -ne $statusProperty) {
+                    $candidateStatus = [int]$statusProperty.Value
+                    if ($candidateStatus -ge 100 -and $candidateStatus -le 599) {
+                        $statusCode = $candidateStatus
+                    }
+                }
+            }
+        }
+        catch { }
+
+        $errorEnvelope = $null
+        $errorDetails = if ($null -eq $requestFailure.ErrorDetails) {
+            ''
+        }
+        else { [string]$requestFailure.ErrorDetails.Message }
+        if (-not [string]::IsNullOrWhiteSpace($errorDetails)) {
+            try { $errorEnvelope = $errorDetails | ConvertFrom-Json -ErrorAction Stop } catch { }
+        }
+        $errorCodes = @(Get-CloudflareNumericErrorCodes -Envelope $errorEnvelope)
+        $ambiguousPost = $Method -eq 'POST' -and
+            ($null -eq $statusCode -or $statusCode -ge 500)
+        $failureSummary = "Cloudflare API request failed ($Method $Path)"
+        if ($statusCode -eq 401 -or $statusCode -eq 403) {
+            $failureSummary += '; verify the account scope and required Cloudflare One Write permissions'
+        }
+        throw (New-CloudflareApiException `
+            -Summary $failureSummary `
+            -HttpStatus $statusCode `
+            -ErrorCodes $errorCodes `
+            -PostOutcomeAmbiguous $ambiguousPost)
     }
 
-    $success = Get-ObjectPropertyValue -Object $response -Name 'success' -Default $true
-    if (-not [bool]$success) {
-        $errorCodes = @()
-        foreach ($apiError in @(Get-ObjectPropertyValue -Object $response -Name 'errors' -Default @())) {
-            $errorCode = Get-ObjectPropertyValue -Object $apiError -Name 'code' -Default $null
-            if ($null -ne $errorCode) { $errorCodes += [string]$errorCode }
-        }
-        $codeSummary = if ($errorCodes.Count -gt 0) { $errorCodes -join ',' } else { 'unknown' }
-        throw "Cloudflare API rejected $Method $Path (error codes: $codeSummary)."
+    $successProperty = if ($null -eq $response) { $null } else { $response.PSObject.Properties['success'] }
+    if ($null -eq $successProperty -or $successProperty.Value -isnot [bool]) {
+        throw (New-CloudflareApiException `
+            -Summary "Cloudflare API returned a malformed response for $Method $Path" `
+            -HttpStatus '2xx' `
+            -PostOutcomeAmbiguous ($Method -eq 'POST'))
+    }
+    if (-not $successProperty.Value) {
+        $errorCodes = @(Get-CloudflareNumericErrorCodes -Envelope $response)
+        throw (New-CloudflareApiException `
+            -Summary "Cloudflare API rejected $Method $Path" `
+            -HttpStatus '2xx' `
+            -ErrorCodes $errorCodes `
+            -PostOutcomeAmbiguous $false)
     }
     return $response
 }
@@ -741,16 +825,49 @@ function Get-CloudflarePagedResults {
 
     $results = @()
     $page = 1
-    do {
+    $maximumPages = 10000
+    while ($true) {
         $separator = if ($ResourcePath.Contains('?')) { '&' } else { '?' }
         $response = Invoke-CloudflareApi -Method GET `
             -Path "$ResourcePath${separator}page=$page&per_page=1000" `
             -ApiToken $ApiToken
-        $results += @(Get-ObjectPropertyValue -Object $response -Name 'result' -Default @())
+        $pageResults = @(Get-ObjectPropertyValue -Object $response -Name 'result' -Default @())
+        $results += $pageResults
         $resultInfo = Get-ObjectPropertyValue -Object $response -Name 'result_info' -Default $null
-        $totalPages = [int](Get-ObjectPropertyValue -Object $resultInfo -Name 'total_pages' -Default 1)
+        $totalPages = 0
+        $totalPagesCandidate = [string](Get-ObjectPropertyValue -Object $resultInfo -Name 'total_pages' -Default '')
+        $hasTotalPages = [int]::TryParse($totalPagesCandidate, [ref]$totalPages) -and $totalPages -ge 0
+        if (-not $hasTotalPages) {
+            $totalCount = [long]0
+            $perPage = 0
+            $hasTotalCount = [long]::TryParse(
+                [string](Get-ObjectPropertyValue -Object $resultInfo -Name 'total_count' -Default ''),
+                [ref]$totalCount
+            ) -and $totalCount -ge 0
+            $hasPerPage = [int]::TryParse(
+                [string](Get-ObjectPropertyValue -Object $resultInfo -Name 'per_page' -Default ''),
+                [ref]$perPage
+            ) -and $perPage -gt 0
+            if ($hasTotalCount -and $hasPerPage) {
+                $totalPages = [int][Math]::Ceiling($totalCount / [double]$perPage)
+                $hasTotalPages = $true
+            }
+        }
+        if (-not $hasTotalPages) {
+            # Older/malformed result_info objects cannot justify another read.
+            # A short page is complete; a full page is rejected rather than
+            # risking either truncation or an unbounded request loop.
+            if ($pageResults.Count -ge 1000) {
+                throw "Cloudflare API pagination metadata is incomplete for $ResourcePath."
+            }
+            break
+        }
+        if ($page -ge $totalPages) { break }
+        if ($page -ge $maximumPages -or $totalPages -gt $maximumPages) {
+            throw "Cloudflare API pagination exceeded the safe page limit for $ResourcePath."
+        }
         $page++
-    } while ($page -le $totalPages)
+    }
     return @($results)
 }
 
@@ -762,6 +879,74 @@ function Test-CloudflareResourceId {
         [Guid]::TryParseExact($Value, 'D', [ref]$parsed)
 }
 
+function Resolve-CloudflareCreation {
+    param(
+        [Parameter(Mandatory)] [ValidateSet('tunnel', 'route')] [string]$ResourceKind,
+        [Parameter(Mandatory)] [string]$ResourcePath,
+        [Parameter(Mandatory)] [string]$ApiToken,
+        [string]$Name,
+        [string]$Network,
+        [string]$TunnelId,
+        [ValidateRange(1, 10)] [int]$Attempts = 3
+    )
+
+    $state = 'not-read'
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            $resources = @(Get-CloudflarePagedResults `
+                -ResourcePath $ResourcePath `
+                -ApiToken $ApiToken)
+            $matches = @(if ($ResourceKind -eq 'tunnel') {
+                $resources | Where-Object {
+                    [string](Get-ObjectPropertyValue -Object $_ -Name 'name' -Default '') -ceq $Name
+                }
+            }
+            else {
+                $resources | Where-Object {
+                    $candidateTunnelId = [string](Get-ObjectPropertyValue -Object $_ -Name 'tunnel_id' -Default '')
+                    if ([string]::IsNullOrWhiteSpace($candidateTunnelId)) {
+                        $candidateTunnelId = [string](Get-ObjectPropertyValue -Object $_ -Name 'tunnelId' -Default '')
+                    }
+                    [string](Get-ObjectPropertyValue -Object $_ -Name 'network' -Default '') -eq $Network -and
+                        $candidateTunnelId -eq $TunnelId
+                }
+            })
+            if ($matches.Count -eq 1) {
+                $resourceId = [string](Get-ObjectPropertyValue -Object $matches[0] -Name 'id' -Default '')
+                if (Test-CloudflareResourceId -Value $resourceId) {
+                    return [pscustomobject]@{
+                        Resolved = $true
+                        ResourceId = $resourceId
+                        State = 'resolved'
+                        Attempts = $attempt
+                    }
+                }
+                $state = 'invalid-id'
+            }
+            elseif ($matches.Count -eq 0) {
+                $state = 'zero-matches'
+            }
+            else {
+                $state = 'multiple-matches'
+            }
+        }
+        catch {
+            $state = 'read-failed'
+        }
+
+        if ($attempt -lt $Attempts) {
+            $delaySeconds = [int][Math]::Min(4, [Math]::Pow(2, $attempt - 1))
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+    return [pscustomobject]@{
+        Resolved = $false
+        ResourceId = $null
+        State = $state
+        Attempts = $Attempts
+    }
+}
+
 function Write-CloudflareTransactionJournal {
     param(
         [Parameter(Mandatory)] [string]$Path,
@@ -770,17 +955,20 @@ function Write-CloudflareTransactionJournal {
         [Parameter(Mandatory)] [string]$TunnelName,
         [Parameter(Mandatory)] [string]$Network,
         [string]$TunnelId,
-        [string]$RouteId
+        [string]$RouteId,
+        [ValidateSet('tunnel-create-started', 'tunnel-created', 'route-create-started', 'route-created')]
+        [string]$MutationState = 'tunnel-create-started'
     )
 
     $journal = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         environmentName = $EnvironmentName
         accountId = $AccountId
         tunnelName = $TunnelName
         network = $Network
         tunnelId = $TunnelId
         routeId = $RouteId
+        mutationState = $MutationState
         updatedAt = [DateTime]::UtcNow.ToString('o')
     }
     [IO.File]::WriteAllText(
@@ -798,46 +986,55 @@ function New-CloudflareTunnelResource {
         [Parameter(Mandatory)] [string]$Name
     )
 
+    $creationException = $null
     try {
         $response = Invoke-CloudflareApi -Method POST `
             -Path "/accounts/$AccountId/cfd_tunnel" `
             -ApiToken $ApiToken `
             -Body ([ordered]@{ name = $Name; config_src = 'cloudflare' })
-        $result = Get-ObjectPropertyValue -Object $response -Name 'result' -Default $null
-        $tunnelId = [string](Get-ObjectPropertyValue -Object $result -Name 'id' -Default '')
-        if (-not (Test-CloudflareResourceId -Value $tunnelId)) {
-            throw 'Cloudflare tunnel creation returned an invalid resource ID.'
-        }
-        return $tunnelId
     }
     catch {
-        $creationFailure = $_
-        # A timeout can happen after Cloudflare committed the request. Reconcile
-        # the exact preflight-unique name once; never retry the POST blindly.
-        try {
-            $encodedName = [Uri]::EscapeDataString($Name)
-            $matches = @(Get-CloudflarePagedResults `
-                -ResourcePath "/accounts/$AccountId/cfd_tunnel?is_deleted=false&name=$encodedName" `
-                -ApiToken $ApiToken | Where-Object {
-                    [string](Get-ObjectPropertyValue -Object $_ -Name 'name' -Default '') -ceq $Name
-                })
-            if ($matches.Count -eq 1) {
-                $reconciledId = [string](Get-ObjectPropertyValue -Object $matches[0] -Name 'id' -Default '')
-                if (Test-CloudflareResourceId -Value $reconciledId) {
-                    return $reconciledId
-                }
-            }
+        $isAmbiguous = $false
+        if ($null -ne $_.Exception.Data -and
+            $_.Exception.Data.Contains('CloudflarePostOutcomeAmbiguous')) {
+            $isAmbiguous = [bool]$_.Exception.Data['CloudflarePostOutcomeAmbiguous']
         }
-        catch {
-            # Preserve the original, token-safe creation failure below.
-        }
-        $ambiguousFailure = [InvalidOperationException]::new(
-            "Cloudflare tunnel creation outcome is unknown after reconciliation. Do not retry the POST manually; the protected transaction journal will be checked on the next run.",
-            $creationFailure.Exception
-        )
-        $ambiguousFailure.Data['CloudflareMutationOutcomeUnknown'] = 'tunnel'
-        throw $ambiguousFailure
+        if (-not $isAmbiguous) { throw }
+        $creationException = $_.Exception
     }
+    if ($null -eq $creationException) {
+        $result = Get-ObjectPropertyValue -Object $response -Name 'result' -Default $null
+        $tunnelId = [string](Get-ObjectPropertyValue -Object $result -Name 'id' -Default '')
+        if (Test-CloudflareResourceId -Value $tunnelId) {
+            return $tunnelId
+        }
+        $creationException = [InvalidOperationException]::new(
+            'Cloudflare tunnel creation returned a success response without a valid resource ID.'
+        )
+    }
+
+    $encodedName = [Uri]::EscapeDataString($Name)
+    $reconciliation = Resolve-CloudflareCreation `
+        -ResourceKind tunnel `
+        -ResourcePath "/accounts/$AccountId/cfd_tunnel?is_deleted=false&name=$encodedName" `
+        -ApiToken $ApiToken `
+        -Name $Name
+    if ($reconciliation.Resolved) {
+        return [string]$reconciliation.ResourceId
+    }
+
+    $ambiguousFailure = [InvalidOperationException]::new(
+        "Cloudflare tunnel creation outcome is unknown after $($reconciliation.Attempts) read-only reconciliation attempts ($($reconciliation.State)). Do not retry the POST manually; the protected transaction journal must be reconciled first.",
+        $creationException
+    )
+    $ambiguousFailure.Data['CloudflareMutationOutcomeUnknown'] = 'tunnel'
+    $ambiguousFailure.Data['CloudflareReconciliationState'] = $reconciliation.State
+    foreach ($key in @('CloudflareHttpStatus', 'CloudflareErrorCodes')) {
+        if ($null -ne $creationException.Data -and $creationException.Data.Contains($key)) {
+            $ambiguousFailure.Data[$key] = $creationException.Data[$key]
+        }
+    }
+    throw $ambiguousFailure
 }
 
 function New-CloudflareRouteResource {
@@ -849,46 +1046,55 @@ function New-CloudflareRouteResource {
         [Parameter(Mandatory)] [string]$Comment
     )
 
+    $creationException = $null
     try {
         $response = Invoke-CloudflareApi -Method POST `
             -Path "/accounts/$AccountId/teamnet/routes" `
             -ApiToken $ApiToken `
             -Body ([ordered]@{ network = $Network; tunnel_id = $TunnelId; comment = $Comment })
-        $result = Get-ObjectPropertyValue -Object $response -Name 'result' -Default $null
-        $routeId = [string](Get-ObjectPropertyValue -Object $result -Name 'id' -Default '')
-        if (-not (Test-CloudflareResourceId -Value $routeId)) {
-            throw 'Cloudflare route creation returned an invalid resource ID.'
-        }
-        return $routeId
     }
     catch {
-        $creationFailure = $_
-        # Reconcile only the exact network+tunnel tuple. Never resend a POST
-        # whose server-side outcome is unknown.
-        try {
-            $matches = @(Get-CloudflarePagedResults `
-                -ResourcePath "/accounts/$AccountId/teamnet/routes" `
-                -ApiToken $ApiToken | Where-Object {
-                    [string](Get-ObjectPropertyValue -Object $_ -Name 'network' -Default '') -eq $Network -and
-                    [string](Get-ObjectPropertyValue -Object $_ -Name 'tunnel_id' -Default '') -eq $TunnelId
-                })
-            if ($matches.Count -eq 1) {
-                $reconciledId = [string](Get-ObjectPropertyValue -Object $matches[0] -Name 'id' -Default '')
-                if (Test-CloudflareResourceId -Value $reconciledId) {
-                    return $reconciledId
-                }
-            }
+        $isAmbiguous = $false
+        if ($null -ne $_.Exception.Data -and
+            $_.Exception.Data.Contains('CloudflarePostOutcomeAmbiguous')) {
+            $isAmbiguous = [bool]$_.Exception.Data['CloudflarePostOutcomeAmbiguous']
         }
-        catch {
-            # Preserve the original, token-safe creation failure below.
-        }
-        $ambiguousFailure = [InvalidOperationException]::new(
-            "Cloudflare route creation outcome is unknown after reconciliation. Do not retry the POST manually; the protected transaction journal will be checked on the next run.",
-            $creationFailure.Exception
-        )
-        $ambiguousFailure.Data['CloudflareMutationOutcomeUnknown'] = 'route'
-        throw $ambiguousFailure
+        if (-not $isAmbiguous) { throw }
+        $creationException = $_.Exception
     }
+    if ($null -eq $creationException) {
+        $result = Get-ObjectPropertyValue -Object $response -Name 'result' -Default $null
+        $routeId = [string](Get-ObjectPropertyValue -Object $result -Name 'id' -Default '')
+        if (Test-CloudflareResourceId -Value $routeId) {
+            return $routeId
+        }
+        $creationException = [InvalidOperationException]::new(
+            'Cloudflare route creation returned a success response without a valid resource ID.'
+        )
+    }
+
+    $reconciliation = Resolve-CloudflareCreation `
+        -ResourceKind route `
+        -ResourcePath "/accounts/$AccountId/teamnet/routes" `
+        -ApiToken $ApiToken `
+        -Network $Network `
+        -TunnelId $TunnelId
+    if ($reconciliation.Resolved) {
+        return [string]$reconciliation.ResourceId
+    }
+
+    $ambiguousFailure = [InvalidOperationException]::new(
+        "Cloudflare route creation outcome is unknown after $($reconciliation.Attempts) read-only reconciliation attempts ($($reconciliation.State)). Do not retry the POST manually; the protected transaction journal must be reconciled first.",
+        $creationException
+    )
+    $ambiguousFailure.Data['CloudflareMutationOutcomeUnknown'] = 'route'
+    $ambiguousFailure.Data['CloudflareReconciliationState'] = $reconciliation.State
+    foreach ($key in @('CloudflareHttpStatus', 'CloudflareErrorCodes')) {
+        if ($null -ne $creationException.Data -and $creationException.Data.Contains($key)) {
+            $ambiguousFailure.Data[$key] = $creationException.Data[$key]
+        }
+    }
+    throw $ambiguousFailure
 }
 
 function Remove-CloudflareProvisioningResources {
@@ -958,10 +1164,36 @@ function Invoke-CloudflareTransactionRecovery {
         $journalNetwork = [string](Get-ObjectPropertyValue -Object $journal -Name 'network' -Default '')
         $journalTunnelId = [string](Get-ObjectPropertyValue -Object $journal -Name 'tunnelId' -Default '')
         $journalRouteId = [string](Get-ObjectPropertyValue -Object $journal -Name 'routeId' -Default '')
-        if ($journalSchema -ne 1 -or
+        $journalMutationState = [string](Get-ObjectPropertyValue -Object $journal -Name 'mutationState' -Default '')
+        if ($journalSchema -eq 1) {
+            # Schema 1 did not record whether the next POST had started. Treat
+            # every missing ID conservatively as an unknown mutation outcome.
+            $journalMutationState = if ([string]::IsNullOrWhiteSpace($journalTunnelId)) {
+                'tunnel-create-started'
+            }
+            elseif ([string]::IsNullOrWhiteSpace($journalRouteId)) {
+                'route-create-started'
+            }
+            else { 'route-created' }
+        }
+        $validMutationShape =
+            ($journalMutationState -eq 'tunnel-create-started' -and
+             [string]::IsNullOrWhiteSpace($journalTunnelId) -and
+             [string]::IsNullOrWhiteSpace($journalRouteId)) -or
+            ($journalMutationState -eq 'tunnel-created' -and
+             -not [string]::IsNullOrWhiteSpace($journalTunnelId) -and
+             [string]::IsNullOrWhiteSpace($journalRouteId)) -or
+            ($journalMutationState -eq 'route-create-started' -and
+             -not [string]::IsNullOrWhiteSpace($journalTunnelId) -and
+             [string]::IsNullOrWhiteSpace($journalRouteId)) -or
+            ($journalMutationState -eq 'route-created' -and
+             -not [string]::IsNullOrWhiteSpace($journalTunnelId) -and
+             -not [string]::IsNullOrWhiteSpace($journalRouteId))
+        if (($journalSchema -ne 1 -and $journalSchema -ne 2) -or
             $journalEnvironment -notmatch '^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$' -or
             $journalTunnelName -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$' -or
             $null -eq (Get-IPv4CidrInfo -Value $journalNetwork) -or
+            -not $validMutationShape -or
             (-not [string]::IsNullOrWhiteSpace($journalTunnelId) -and
              -not (Test-CloudflareResourceId -Value $journalTunnelId)) -or
             (-not [string]::IsNullOrWhiteSpace($journalRouteId) -and
@@ -978,48 +1210,60 @@ function Invoke-CloudflareTransactionRecovery {
         $knownRoutes = @(Get-CloudflarePagedResults `
             -ResourcePath "/accounts/$AccountId/teamnet/routes" `
             -ApiToken $ApiToken)
-        $ownedTunnel = if ([string]::IsNullOrWhiteSpace($journalTunnelId)) {
-            @($knownTunnels | Where-Object {
+        $ownedTunnel = @(if ([string]::IsNullOrWhiteSpace($journalTunnelId)) {
+            $knownTunnels | Where-Object {
                 [string](Get-ObjectPropertyValue -Object $_ -Name 'name' -Default '') -ceq $journalTunnelName
-            })
+            }
         }
         else {
-            @($knownTunnels | Where-Object {
+            $knownTunnels | Where-Object {
                 [string](Get-ObjectPropertyValue -Object $_ -Name 'id' -Default '') -eq $journalTunnelId
-            })
+            }
+        })
+        if ($ownedTunnel.Count -gt 1) {
+            throw "Cloudflare transaction recovery found multiple matching tunnels; the unknown journal was preserved and no resource was deleted: $journalPath"
         }
         if ($ownedTunnel.Count -eq 1 -and [string]::IsNullOrWhiteSpace($journalTunnelId)) {
-            $journalTunnelId = [string](Get-ObjectPropertyValue -Object $ownedTunnel[0] -Name 'id' -Default '')
-            if (-not (Test-CloudflareResourceId -Value $journalTunnelId)) {
+            $discoveredTunnelId = [string](Get-ObjectPropertyValue -Object $ownedTunnel[0] -Name 'id' -Default '')
+            if (-not (Test-CloudflareResourceId -Value $discoveredTunnelId)) {
                 throw "Cloudflare transaction recovery found an invalid tunnel ID: $journalPath"
             }
+            $journalTunnelId = $discoveredTunnelId
         }
-        $ownedRoute = if ([string]::IsNullOrWhiteSpace($journalRouteId)) {
+        $ownedRoute = @(if ([string]::IsNullOrWhiteSpace($journalRouteId)) {
             if ([string]::IsNullOrWhiteSpace($journalTunnelId)) {
-                @()
             }
             else {
-                @($knownRoutes | Where-Object {
+                $knownRoutes | Where-Object {
+                    $candidateTunnelId = [string](Get-ObjectPropertyValue -Object $_ -Name 'tunnel_id' -Default '')
+                    if ([string]::IsNullOrWhiteSpace($candidateTunnelId)) {
+                        $candidateTunnelId = [string](Get-ObjectPropertyValue -Object $_ -Name 'tunnelId' -Default '')
+                    }
                     [string](Get-ObjectPropertyValue -Object $_ -Name 'network' -Default '') -eq $journalNetwork -and
-                    [string](Get-ObjectPropertyValue -Object $_ -Name 'tunnel_id' -Default '') -eq $journalTunnelId
-                })
+                        $candidateTunnelId -eq $journalTunnelId
+                }
             }
         }
         else {
-            @($knownRoutes | Where-Object {
+            $knownRoutes | Where-Object {
                 [string](Get-ObjectPropertyValue -Object $_ -Name 'id' -Default '') -eq $journalRouteId
-            })
-        }
-        if ($ownedTunnel.Count -gt 1 -or $ownedRoute.Count -gt 1) {
-            throw "Cloudflare transaction recovery found ambiguous matching resources: $journalPath"
+            }
+        })
+        if ($ownedRoute.Count -gt 1) {
+            throw "Cloudflare transaction recovery found multiple matching routes; the unknown journal was preserved and no resource was deleted: $journalPath"
         }
         if ($ownedTunnel.Count -eq 1 -and
             [string](Get-ObjectPropertyValue -Object $ownedTunnel[0] -Name 'name' -Default '') -cne $journalTunnelName) {
             throw "Cloudflare transaction tunnel ownership check failed: $journalPath"
         }
-        if ($ownedRoute.Count -eq 1 -and
-            [string](Get-ObjectPropertyValue -Object $ownedRoute[0] -Name 'tunnel_id' -Default '') -ne $journalTunnelId) {
-            throw "Cloudflare transaction route ownership check failed: $journalPath"
+        if ($ownedRoute.Count -eq 1) {
+            $ownedRouteTunnelId = [string](Get-ObjectPropertyValue -Object $ownedRoute[0] -Name 'tunnel_id' -Default '')
+            if ([string]::IsNullOrWhiteSpace($ownedRouteTunnelId)) {
+                $ownedRouteTunnelId = [string](Get-ObjectPropertyValue -Object $ownedRoute[0] -Name 'tunnelId' -Default '')
+            }
+            if ($ownedRouteTunnelId -ne $journalTunnelId) {
+                throw "Cloudflare transaction route ownership check failed: $journalPath"
+            }
         }
         if ($ownedRoute.Count -eq 1 -and
             [string](Get-ObjectPropertyValue -Object $ownedRoute[0] -Name 'network' -Default '') -ne $journalNetwork) {
@@ -1031,6 +1275,45 @@ function Invoke-CloudflareTransactionRecovery {
         }
         if ($ownedRoute.Count -eq 1 -and $ownedTunnel.Count -ne 1) {
             throw "Cloudflare transaction route exists without its recorded tunnel: $journalPath"
+        }
+
+        if ($journalMutationState -eq 'tunnel-create-started') {
+            if ($ownedTunnel.Count -eq 0) {
+                throw "Cloudflare tunnel creation is still unverified (zero exact matches). The unknown journal was preserved and no new POST or destructive recovery was attempted: $journalPath"
+            }
+            if ($ownedRoute.Count -ne 0) {
+                throw "Cloudflare recovery found an unexpected route for an unjournaled tunnel result. The journal was preserved and nothing was deleted: $journalPath"
+            }
+            # The exact, preflight-unique name now resolves to one valid ID.
+            # Journal that proof before any delete so another interruption is safe.
+            $journalMutationState = 'tunnel-created'
+            Write-CloudflareTransactionJournal `
+                -Path $journalPath `
+                -EnvironmentName $journalEnvironment `
+                -AccountId $journalAccount `
+                -TunnelName $journalTunnelName `
+                -Network $journalNetwork `
+                -TunnelId $journalTunnelId `
+                -MutationState $journalMutationState
+        }
+        elseif ($journalMutationState -eq 'route-create-started') {
+            if ($ownedTunnel.Count -ne 1) {
+                throw "Cloudflare route creation cannot be reconciled because its recorded tunnel is not verifiable. The journal was preserved and nothing was deleted: $journalPath"
+            }
+            if ($ownedRoute.Count -eq 0) {
+                throw "Cloudflare route creation is still unverified (zero exact matches). The unknown journal was preserved and no new POST or destructive recovery was attempted: $journalPath"
+            }
+            $journalRouteId = [string](Get-ObjectPropertyValue -Object $ownedRoute[0] -Name 'id' -Default '')
+            $journalMutationState = 'route-created'
+            Write-CloudflareTransactionJournal `
+                -Path $journalPath `
+                -EnvironmentName $journalEnvironment `
+                -AccountId $journalAccount `
+                -TunnelName $journalTunnelName `
+                -Network $journalNetwork `
+                -TunnelId $journalTunnelId `
+                -RouteId $journalRouteId `
+                -MutationState $journalMutationState
         }
 
         $routeToRemove = if ($ownedRoute.Count -eq 1) {
@@ -2469,7 +2752,8 @@ try {
                 -EnvironmentName $EnvironmentName `
                 -AccountId $cloudflareAccountId `
                 -TunnelName $cloudflareTunnelName `
-                -Network $cloudflarePrivateCidr
+                -Network $cloudflarePrivateCidr `
+                -MutationState 'tunnel-create-started'
             $cloudflareTunnelId = New-CloudflareTunnelResource `
                 -AccountId $cloudflareAccountId `
                 -ApiToken $cloudflareApiToken `
@@ -2481,7 +2765,8 @@ try {
                 -AccountId $cloudflareAccountId `
                 -TunnelName $cloudflareTunnelName `
                 -Network $cloudflarePrivateCidr `
-                -TunnelId $createdCloudflareTunnelId
+                -TunnelId $createdCloudflareTunnelId `
+                -MutationState 'tunnel-created'
         }
 
             $tokenResponse = Invoke-CloudflareApi -Method GET `
@@ -2497,6 +2782,14 @@ try {
             }
 
         if (-not $targetExists) {
+                Write-CloudflareTransactionJournal `
+                    -Path $cloudflareTransactionJournalPath `
+                    -EnvironmentName $EnvironmentName `
+                    -AccountId $cloudflareAccountId `
+                    -TunnelName $cloudflareTunnelName `
+                    -Network $cloudflarePrivateCidr `
+                    -TunnelId $createdCloudflareTunnelId `
+                    -MutationState 'route-create-started'
                 $cloudflareRouteId = New-CloudflareRouteResource `
                     -AccountId $cloudflareAccountId `
                     -ApiToken $cloudflareApiToken `
@@ -2511,7 +2804,8 @@ try {
                     -TunnelName $cloudflareTunnelName `
                     -Network $cloudflarePrivateCidr `
                     -TunnelId $createdCloudflareTunnelId `
-                    -RouteId $createdCloudflareRouteId
+                    -RouteId $createdCloudflareRouteId `
+                    -MutationState 'route-created'
         }
 
         try {

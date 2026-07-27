@@ -602,6 +602,14 @@ foreach ($RequiredLine in @(
 }
 Assert-False ($SshConfig.Contains('PasswordAuthentication yes')) 'password SSH authentication remains disabled'
 
+$DesktopEntrypoint = [IO.File]::ReadAllText((Join-Path $RepoRoot 'templates\ubuntu-dind\docker_entrypoint.sh'))
+Assert-True (
+    $DesktopEntrypoint -match '(?m)^\s*chmod 0777 "\$\{account_home\}" /workspace\r?$'
+) 'Windows bind roots are explicitly made writable'
+Assert-True (
+    $DesktopEntrypoint.Contains('runuser -u "${account_name}" -- test -w "${writable_path}"')
+) 'desktop entrypoint fails fast when bind storage is not writable'
+
 $ComposeTemplate = [IO.File]::ReadAllText((Join-Path $RepoRoot 'templates\ubuntu-dind\compose.yaml.template'))
 Assert-True ($ComposeTemplate.Contains('"${HOST_ADDRESS}:${RDP_PORT}:3389"')) 'LAN RDP port mapping'
 Assert-False ($ComposeTemplate.Contains('"${HOST_ADDRESS}:3389:3389"')) 'reserved host RDP port is not published'

@@ -133,6 +133,10 @@ assert_file_contains "${ssh_config}" 'AuthenticationMethods publickey'
 assert_file_contains "${ssh_config}" 'PermitRootLogin no'
 assert_file_not_contains "${ssh_config}" 'PasswordAuthentication yes'
 
+readonly desktop_entrypoint="${repo_root}/templates/ubuntu-dind/docker_entrypoint.sh"
+assert_file_contains "${desktop_entrypoint}" '    chmod 0777 "${account_home}" /workspace'
+assert_file_contains "${desktop_entrypoint}" '    if ! runuser -u "${account_name}" -- test -w "${writable_path}"; then'
+
 readonly compose_template="${repo_root}/templates/ubuntu-dind/compose.yaml.template"
 grep -Fq -- '"${HOST_ADDRESS}:${RDP_PORT}:3389"' "${compose_template}" ||
     fail 'LAN RDP mapping is missing'

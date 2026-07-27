@@ -61,7 +61,18 @@ else
     # ownership can prevent PowerShell from renaming the host directory.
     install -d -m 0777 "${account_home}"
     install -d -m 0777 /workspace
+    # The bind directories already exist when the container starts. GNU
+    # install does not update the mode of an existing directory, so apply the
+    # Docker Desktop/DrvFS-compatible mode explicitly on every startup.
+    chmod 0777 "${account_home}" /workspace
 fi
+
+for writable_path in "${account_home}" /workspace; do
+    if ! runuser -u "${account_name}" -- test -w "${writable_path}"; then
+        echo "ERROR: ${writable_path} is not writable by ${account_name}; check the bind-mount ACL and mode." >&2
+        exit 1
+    fi
+done
 
 # A bind-mounted empty home hides files created by useradd in the image.
 if [[ ! -e "${account_home}/.docker-vm-home-initialized" ]]; then

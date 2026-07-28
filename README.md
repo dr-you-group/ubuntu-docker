@@ -29,6 +29,8 @@ Each default Cloudflare environment has its own Ubuntu desktop, Linux account, S
 | Local SSH | Docker host LAN address and selected host SSH port | Generated PEM key |
 | Remote SSH | Cloudflare private IP and port `22` | The same generated PEM key |
 
+Visual Studio Code is installed from [Microsoft's official Linux repository](https://code.visualstudio.com/docs/setup/linux). Launch it from the Xfce application menu or run `code` in the desktop terminal; no separate `.deb` installation is required.
+
 Host port `3389` remains reserved for the Windows server. The generator never publishes, changes, or takes over that port.
 
 ## Requirements
@@ -560,6 +562,7 @@ The generators retain `wireguard` mode for existing deployments. It requires a s
 
 - SSH password login is disabled. The prompted account password is used for RDP and `sudo`.
 - The DinD daemon is privileged and is not a VM-grade security boundary.
+- Docker blocks the nested namespaces required by Electron's sandbox, so the image's VS Code-only launcher adds `--no-sandbox`. Open only trusted workspaces and extensions; the Compose service does not relax Docker's container-wide seccomp or AppArmor settings.
 - Never commit the root `.env`, generated secrets, PEM keys, RDP files, or Tunnel tokens.
 - Do not run `docker compose down -v` unless permanent loss of DinD data and SSH host keys is intended.
 - Before permanently deleting a Cloudflare environment, remove its private `/32` route and then its Tunnel using the IDs in `.environment.json`.

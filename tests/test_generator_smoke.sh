@@ -114,6 +114,8 @@ printf '%s\n' "${password_value}" | PATH="${fake_bin}:${PATH}" \
 [[ -f "${project_path}/${environment_name}_ssh.pub" ]] || fail 'SSH public key is missing'
 [[ -x "${project_path}/configure_xrdp_korean_keyboard.sh" ]] ||
     fail 'XRDP Korean keyboard setup is missing or not executable'
+[[ -x "${project_path}/vscode_launcher.sh" ]] ||
+    fail 'VS Code container launcher is missing or not executable'
 
 asserted_private_mode="$(stat -c '%a' "${project_path}/${environment_name}_ssh.pem")"
 [[ "${asserted_private_mode}" == 600 ]] || fail "SSH private-key mode is ${asserted_private_mode}, expected 600"

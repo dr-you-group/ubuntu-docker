@@ -27,6 +27,16 @@ docker compose version
 
 The DinD daemon is isolated and available only through mutual TLS. Port `2376` is not published.
 
+## Use Visual Studio Code
+
+Visual Studio Code is preinstalled from [Microsoft's official Linux repository](https://code.visualstudio.com/docs/setup/linux). Open it from the Xfce application menu or run:
+
+```bash
+code
+```
+
+Docker blocks the nested namespaces required by Electron's sandbox, so this image's VS Code-only launcher automatically adds `--no-sandbox`. Open only trusted workspaces and extensions; the Compose service does not relax Docker's container-wide seccomp or AppArmor settings.
+
 ## Storage and resources
 
 - Home: `__HOME_STORAGE__`
@@ -67,4 +77,4 @@ Reapply the LAN-only host firewall policy with administrator/root privileges:
 __FIREWALL_COMMAND__
 ```
 
-__REMOTE_DATA_WARNING__ Firefox and Korean input are preconfigured.
+__REMOTE_DATA_WARNING__ Firefox, Visual Studio Code (`code`), and Korean input are preconfigured.

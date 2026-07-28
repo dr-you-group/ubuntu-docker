@@ -12,7 +12,7 @@ LABEL org.opencontainers.image.description="Ubuntu 26.04 with Xfce, XRDP, OpenSS
 ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
     TZ=Asia/Seoul \
-    PATH=/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/opt/ubuntu-dind/bin:/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Ubuntu 26.04 reserves UID/GID 1000 for an unused default account. Remove it so
 # Linux hosts can map their current user into the desktop container without a
@@ -35,6 +35,14 @@ RUN apt-get update \
         -o /etc/apt/keyrings/docker.asc \
     && test "$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc \
         | awk -F: '$1 == "fpr" { print $10; exit }')" = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88" \
+    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+        -o /etc/apt/keyrings/packages.microsoft.com.asc \
+    && test "$(gpg --show-keys --with-colons /etc/apt/keyrings/packages.microsoft.com.asc \
+        | awk -F: '$1 == "fpr" { print $10; exit }')" = "BC528686B50D79E339D3721CEB3E94ADBE1229CF" \
+    && gpg --dearmor --yes \
+        --output /usr/share/keyrings/microsoft.gpg \
+        /etc/apt/keyrings/packages.microsoft.com.asc \
+    && chmod 0644 /usr/share/keyrings/microsoft.gpg \
     && printf '%s\n' \
         'Types: deb' \
         'URIs: https://packages.mozilla.org/apt' \
@@ -55,8 +63,22 @@ RUN apt-get update \
         "Architectures: $(dpkg --print-architecture)" \
         'Signed-By: /etc/apt/keyrings/docker.asc' \
         > /etc/apt/sources.list.d/docker.sources \
+    && printf '%s\n' \
+        'Types: deb' \
+        'URIs: https://packages.microsoft.com/repos/code' \
+        'Suites: stable' \
+        'Components: main' \
+        "Architectures: $(dpkg --print-architecture)" \
+        'Signed-By: /usr/share/keyrings/microsoft.gpg' \
+        > /etc/apt/sources.list.d/vscode.sources \
+    && printf '%s\n' \
+        'Package: code' \
+        'Pin: origin "packages.microsoft.com"' \
+        'Pin-Priority: 9999' \
+        > /etc/apt/preferences.d/code \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        code \
         dbus \
         dbus-x11 \
         dconf-cli \
@@ -106,9 +128,17 @@ RUN apt-get update \
     && grep -qx 'SessionSockdirGroup=xrdp' /etc/xrdp/sesman.ini \
     && test -x /usr/bin/firefox \
     && test -x /usr/bin/docker \
+    && test -x /usr/bin/code \
     && docker compose version \
     && docker buildx version \
     && ln -sf /usr/bin/firefox /usr/local/bin/www-browser \
+    && sed -i '/^PATH=/d' /etc/environment \
+    && printf '%s\n' \
+        'PATH="/opt/ubuntu-dind/bin:/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+        >> /etc/environment \
+    && grep -Fqx \
+        'PATH="/opt/ubuntu-dind/bin:/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+        /etc/environment \
     && mkdir -p /run/sshd /var/log/supervisor /workspace \
     && rm -f /etc/ssh/ssh_host_* \
     && apt-get clean \
@@ -123,12 +153,27 @@ COPY start_xfce_session.sh /usr/local/sbin/start_xfce_session.sh
 COPY configure_xrdp_korean_keyboard.sh /usr/local/sbin/configure_xrdp_korean_keyboard.sh
 COPY supervisord.conf /etc/supervisor/conf.d/docker-vm.conf
 COPY docker_entrypoint.sh /usr/local/sbin/docker_vm_entrypoint.sh
+COPY vscode_launcher.sh /opt/ubuntu-dind/bin/code
 
 RUN chmod 0755 /etc/xrdp/startwm.sh \
         /usr/local/sbin/start_xfce_session.sh \
         /usr/local/sbin/configure_xrdp_korean_keyboard.sh \
+        /opt/ubuntu-dind/bin/code \
         /usr/local/sbin/docker_vm_entrypoint.sh \
-    && /usr/local/sbin/configure_xrdp_korean_keyboard.sh
+    && /usr/local/sbin/configure_xrdp_korean_keyboard.sh \
+    && install -d -m 0755 /usr/local/share/applications \
+    && for desktop_file in code.desktop code-url-handler.desktop; do \
+        sed 's|^Exec=/usr/share/code/code|Exec=/opt/ubuntu-dind/bin/code|' \
+            "/usr/share/applications/${desktop_file}" \
+            > "/usr/local/share/applications/${desktop_file}" || exit 1; \
+        chmod 0644 "/usr/local/share/applications/${desktop_file}" || exit 1; \
+        grep -Fq 'Exec=/opt/ubuntu-dind/bin/code' \
+            "/usr/local/share/applications/${desktop_file}" || exit 1; \
+        if grep -Fq 'Exec=/usr/share/code/code' \
+            "/usr/local/share/applications/${desktop_file}"; then \
+            exit 1; \
+        fi; \
+    done
 
 # 3389 is only the container-internal XRDP port. The generator forbids host port 3389.
 EXPOSE 22 3389

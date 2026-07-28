@@ -663,6 +663,37 @@ Assert-True (
 Assert-True (
     $DesktopDockerfile.Contains('    && /usr/local/sbin/configure_xrdp_korean_keyboard.sh')
 ) 'desktop applies the XRDP Korean keyboard setup'
+Assert-True (
+    $DesktopDockerfile.Contains(
+        '    PATH=/opt/ubuntu-dind/bin:/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    )
+) 'desktop PATH selects the container-safe VS Code launcher'
+Assert-True (
+    $DesktopDockerfile.Contains(
+        '        ''PATH="/opt/ubuntu-dind/bin:/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"'' \'
+    )
+) 'desktop persists the VS Code launcher PATH for PAM sessions'
+Assert-True ($DesktopDockerfile.Contains('BC528686B50D79E339D3721CEB3E94ADBE1229CF')) 'desktop verifies the Microsoft repository key'
+Assert-True ($DesktopDockerfile.Contains('URIs: https://packages.microsoft.com/repos/code')) 'desktop configures the official VS Code repository'
+Assert-True ($DesktopDockerfile.Contains('        code \')) 'desktop installs Visual Studio Code'
+Assert-True (
+    $DesktopDockerfile.Contains('COPY vscode_launcher.sh /opt/ubuntu-dind/bin/code')
+) 'desktop copies the container-safe VS Code launcher'
+Assert-True (
+    $DesktopDockerfile.Contains('s|^Exec=/usr/share/code/code|Exec=/opt/ubuntu-dind/bin/code|')
+) 'desktop overrides VS Code menu launchers'
+Assert-True (
+    $DesktopDockerfile.Contains('/usr/local/share/applications/${desktop_file}')
+) 'desktop installs local VS Code menu overrides'
+Assert-True (
+    $DesktopDockerfile.Contains('> "/usr/local/share/applications/${desktop_file}" || exit 1;')
+) 'desktop menu override fails closed'
+
+$VsCodeLauncher = [IO.File]::ReadAllText(
+    (Join-Path $RepoRoot 'templates\ubuntu-dind\vscode_launcher.sh')
+)
+Assert-True ($VsCodeLauncher.Contains('real_binary="${VSCODE_REAL_BINARY:-/usr/bin/code}"')) 'VS Code launcher selects the vendor CLI'
+Assert-True ($VsCodeLauncher.Contains('exec "${real_binary}" --no-sandbox "$@"')) 'VS Code launcher scopes the sandbox exception'
 Assert-True ($DesktopDockerfile.Contains('        fonts-noto-color-emoji \')) 'desktop installs emoji glyphs'
 Assert-True ($DesktopDockerfile.Contains('        fonts-powerline \')) 'desktop installs Powerline glyphs'
 Assert-True ($DesktopDockerfile.Contains('    && update-locale LANG=en_US.UTF-8 \')) 'desktop persists the UTF-8 locale for PAM sessions'

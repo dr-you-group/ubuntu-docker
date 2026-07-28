@@ -170,7 +170,29 @@ done
 
 readonly desktop_dockerfile="${repo_root}/templates/ubuntu-dind/Dockerfile"
 assert_file_contains "${desktop_dockerfile}" 'COPY configure_xrdp_korean_keyboard.sh /usr/local/sbin/configure_xrdp_korean_keyboard.sh'
-assert_file_contains "${desktop_dockerfile}" '    && /usr/local/sbin/configure_xrdp_korean_keyboard.sh'
+assert_file_contains "${desktop_dockerfile}" '    && /usr/local/sbin/configure_xrdp_korean_keyboard.sh \'
+assert_file_contains "${desktop_dockerfile}" '    PATH=/opt/ubuntu-dind/bin:/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+assert_file_contains "${desktop_dockerfile}" '        '\''URIs: https://packages.microsoft.com/repos/code'\'' \'
+assert_file_contains "${desktop_dockerfile}" '        code \'
+assert_file_contains "${desktop_dockerfile}" 'COPY vscode_launcher.sh /opt/ubuntu-dind/bin/code'
+assert_file_contains "${desktop_dockerfile}" '        /opt/ubuntu-dind/bin/code \'
+assert_file_contains "${desktop_dockerfile}" '        '\''PATH="/opt/ubuntu-dind/bin:/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"'\'' \'
+grep -Fq -- 'BC528686B50D79E339D3721CEB3E94ADBE1229CF' "${desktop_dockerfile}" ||
+    fail 'Desktop image does not verify the Microsoft repository signing key'
+grep -Fq -- "sed 's|^Exec=/usr/share/code/code|Exec=/opt/ubuntu-dind/bin/code|'" \
+    "${desktop_dockerfile}" || fail 'Desktop image does not override VS Code menu launchers'
+grep -Fq -- '/usr/local/share/applications/${desktop_file}' "${desktop_dockerfile}" ||
+    fail 'Desktop image does not install local VS Code menu overrides'
+grep -Fq -- '> "/usr/local/share/applications/${desktop_file}" || exit 1;' "${desktop_dockerfile}" ||
+    fail 'Desktop image menu override does not fail closed'
+
+readonly vscode_launcher="${repo_root}/templates/ubuntu-dind/vscode_launcher.sh"
+assert_file_contains \
+    "${vscode_launcher}" \
+    'real_binary="${VSCODE_REAL_BINARY:-/usr/bin/code}"'
+assert_file_contains \
+    "${vscode_launcher}" \
+    'exec "${real_binary}" --no-sandbox "$@"'
 assert_file_contains "${desktop_dockerfile}" '        fonts-noto-color-emoji \'
 assert_file_contains "${desktop_dockerfile}" '        fonts-powerline \'
 assert_file_contains "${desktop_dockerfile}" '    && update-locale LANG=en_US.UTF-8 \'
@@ -249,5 +271,6 @@ while IFS= read -r tracked_path; do
 done < <(git -C "${repo_root}" ls-files)
 
 bash "${repo_root}/tests/test_xrdp_korean_keyboard.sh"
+bash "${repo_root}/tests/test_vscode_launcher.sh"
 
 printf 'Linux static and unit tests passed.\n'

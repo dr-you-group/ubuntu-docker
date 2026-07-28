@@ -630,6 +630,19 @@ Assert-True (
     $WritableCheckIndex -gt $HomePermissionIndex
 ) 'desktop home permissions are restored after skeleton initialization and before writability checks'
 
+$XrdpStartWindowManager = [IO.File]::ReadAllText((Join-Path $RepoRoot 'templates\ubuntu-dind\xrdp_startwm.sh'))
+Assert-True (
+    $XrdpStartWindowManager.Contains('export LANG="${LANG:-en_US.UTF-8}"')
+) 'XRDP session has a UTF-8 locale fallback'
+
+$DesktopDockerfile = [IO.File]::ReadAllText((Join-Path $RepoRoot 'templates\ubuntu-dind\Dockerfile'))
+Assert-True ($DesktopDockerfile.Contains('        fonts-noto-color-emoji \')) 'desktop installs emoji glyphs'
+Assert-True ($DesktopDockerfile.Contains('        fonts-powerline \')) 'desktop installs Powerline glyphs'
+Assert-True ($DesktopDockerfile.Contains('    && update-locale LANG=en_US.UTF-8 \')) 'desktop persists the UTF-8 locale for PAM sessions'
+Assert-True ($DesktopDockerfile.Contains("    && grep -Fqx 'LANG=en_US.UTF-8' /etc/default/locale \")) 'desktop verifies the PAM locale file'
+Assert-True ($DesktopDockerfile.Contains(':charset=1F680')) 'desktop verifies emoji glyph coverage'
+Assert-True ($DesktopDockerfile.Contains(':charset=E0A0')) 'desktop verifies Powerline glyph coverage'
+
 $ComposeTemplate = [IO.File]::ReadAllText((Join-Path $RepoRoot 'templates\ubuntu-dind\compose.yaml.template'))
 Assert-True ($ComposeTemplate.Contains('"${HOST_ADDRESS}:${RDP_PORT}:3389"')) 'LAN RDP port mapping'
 Assert-False ($ComposeTemplate.Contains('"${HOST_ADDRESS}:3389:3389"')) 'reserved host RDP port is not published'

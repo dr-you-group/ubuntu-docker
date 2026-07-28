@@ -65,6 +65,8 @@ RUN apt-get update \
         docker-compose-plugin \
         firefox \
         fonts-noto-cjk \
+        fonts-noto-color-emoji \
+        fonts-powerline \
         git \
         ibus \
         ibus-gtk3 \
@@ -90,6 +92,10 @@ RUN apt-get update \
         'if [ -e /usr/bin/systemd-cat ] && [ -S /run/systemd/journal/socket ] ; then' \
         /usr/share/im-config/initializer \
     && locale-gen en_US.UTF-8 ko_KR.UTF-8 \
+    && update-locale LANG=en_US.UTF-8 \
+    && grep -Fqx 'LANG=en_US.UTF-8' /etc/default/locale \
+    && test -n "$(fc-list ':charset=1F680' -f '%{file}\n' | head -n 1)" \
+    && test -n "$(fc-list ':charset=E0A0' -f '%{file}\n' | head -n 1)" \
     && ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
     && printf '%s\n' "${TZ}" > /etc/timezone \
     && groupadd --gid "${ACCOUNT_GID}" "${ACCOUNT_NAME}" \

@@ -1,6 +1,7 @@
 #!/bin/sh
 
 unset DBUS_SESSION_BUS_ADDRESS
+export LANG="${LANG:-en_US.UTF-8}"
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 export GTK_IM_MODULE=ibus
 export QT_IM_MODULE=ibus

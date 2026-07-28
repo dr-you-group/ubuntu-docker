@@ -147,7 +147,18 @@ writable_check_line="$(grep -n -F -- 'for writable_path in "${account_home}" "${
 (( home_initialization_line < home_permission_line && home_permission_line < writable_check_line )) ||
     fail 'Desktop home permissions must be restored after skeleton initialization and before writability checks'
 
+readonly xrdp_startwm="${repo_root}/templates/ubuntu-dind/xrdp_startwm.sh"
+assert_file_contains "${xrdp_startwm}" 'export LANG="${LANG:-en_US.UTF-8}"'
+
 readonly desktop_dockerfile="${repo_root}/templates/ubuntu-dind/Dockerfile"
+assert_file_contains "${desktop_dockerfile}" '        fonts-noto-color-emoji \'
+assert_file_contains "${desktop_dockerfile}" '        fonts-powerline \'
+assert_file_contains "${desktop_dockerfile}" '    && update-locale LANG=en_US.UTF-8 \'
+assert_file_contains "${desktop_dockerfile}" "    && grep -Fqx 'LANG=en_US.UTF-8' /etc/default/locale \\"
+grep -Fq -- ':charset=1F680' "${desktop_dockerfile}" ||
+    fail 'Desktop image does not verify emoji glyph coverage'
+grep -Fq -- ':charset=E0A0' "${desktop_dockerfile}" ||
+    fail 'Desktop image does not verify Powerline glyph coverage'
 assert_file_contains "${desktop_dockerfile}" 'RUN if getent passwd ubuntu >/dev/null 2>&1; then userdel --remove ubuntu; fi \'
 assert_file_contains "${desktop_dockerfile}" '    && if getent group ubuntu >/dev/null 2>&1; then groupdel ubuntu; fi'
 ubuntu_cleanup_line="$(grep -n -F -- 'userdel --remove ubuntu' "${desktop_dockerfile}" | cut -d: -f1)"

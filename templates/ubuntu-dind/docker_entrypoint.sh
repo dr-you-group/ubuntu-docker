@@ -18,12 +18,25 @@ if [[ ! -r "${password_file}" ]]; then
     exit 1
 fi
 
-if [[ ! -r "${authorized_keys_file}" ]]; then
+if [[ ! -r "${authorized_keys_file}" || ! -s "${authorized_keys_file}" ]]; then
     printf 'ERROR: SSH authorized-keys secret is not readable: %s\n' "${authorized_keys_file}" >&2
     exit 1
 fi
-if [[ ! -s "${authorized_keys_file}" ]] || ! ssh-keygen -l -f "${authorized_keys_file}" >/dev/null 2>&1; then
-    printf 'ERROR: SSH authorized-keys secret is empty or invalid\n' >&2
+
+mapfile -t authorized_key_lines < <(awk 'NF { print }' "${authorized_keys_file}")
+if (( ${#authorized_key_lines[@]} != 1 )); then
+    printf 'ERROR: SSH authorized-keys secret must contain exactly one public key\n' >&2
+    exit 1
+fi
+read -r authorized_key_type authorized_key_blob _ <<<"${authorized_key_lines[0]}"
+if [[ "${authorized_key_type}" != ssh-rsa ||
+      ! "${authorized_key_blob}" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; then
+    printf 'ERROR: SSH authorized-keys secret must contain one RSA public key without options\n' >&2
+    exit 1
+fi
+canonical_authorized_key="${authorized_key_type} ${authorized_key_blob}"
+if ! printf '%s\n' "${canonical_authorized_key}" | ssh-keygen -l -f - >/dev/null 2>&1; then
+    printf 'ERROR: SSH authorized-keys secret contains an invalid RSA public key\n' >&2
     exit 1
 fi
 
@@ -41,9 +54,10 @@ readonly account_gid="$(id -g "${account_name}")"
 
 # Keep authorized keys outside the bind-mounted home. Docker Desktop bind
 # permissions can otherwise make OpenSSH StrictModes reject a valid key.
+readonly installed_authorized_key="/etc/ssh/authorized_keys/${account_name}"
 install -d -m 0755 -o root -g root /etc/ssh/authorized_keys
-install -m 0644 -o root -g root \
-    "${authorized_keys_file}" "/etc/ssh/authorized_keys/${account_name}"
+install -m 0644 -o root -g root /dev/null "${installed_authorized_key}"
+printf '%s\n' "${canonical_authorized_key}" >"${installed_authorized_key}"
 
 if [[ "${gpu_enabled}" == 1 ]]; then
     if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -205,10 +219,14 @@ for key_type in rsa ecdsa ed25519; do
 done
 sshd -t
 effective_sshd_config="$(sshd -T -C "user=${account_name},host=${account_name},addr=127.0.0.1")"
+grep -qx 'strictmodes yes' <<<"${effective_sshd_config}"
+grep -qx 'pubkeyauthentication yes' <<<"${effective_sshd_config}"
 grep -qx 'passwordauthentication no' <<<"${effective_sshd_config}"
 grep -qx 'kbdinteractiveauthentication no' <<<"${effective_sshd_config}"
 grep -qx 'authenticationmethods publickey' <<<"${effective_sshd_config}"
 grep -qx 'authorizedkeysfile /etc/ssh/authorized_keys/%u' <<<"${effective_sshd_config}"
+grep -qx 'permitrootlogin no' <<<"${effective_sshd_config}"
+grep -qx "allowusers ${account_name}" <<<"${effective_sshd_config}"
 
 rm -f /run/xrdp/xrdp.pid /run/xrdp/xrdp-sesman.pid
 rm -rf /run/xrdp/sockdir

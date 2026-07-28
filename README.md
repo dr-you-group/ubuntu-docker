@@ -424,6 +424,31 @@ chmod 600 "${environment_name}_ssh.pem"
 ssh -o IdentitiesOnly=yes -i "./${environment_name}_ssh.pem" "${linux_account}@${private_ip}"
 ```
 
+In VS Code Remote - SSH or another graphical SSH client, split the command into fields. `User` must contain only the Linux account name. Do not put `ssh`, `user@host`, or the entire command in that field:
+
+```sshconfig
+Host replace-with-environment-name
+    HostName 10.210.0.2
+    User replace-with-linux-account
+    Port 22
+    IdentityFile /absolute/path/to/replace-with-environment-name_ssh.pem
+    IdentitiesOnly yes
+```
+
+Compare the PEM fingerprint with the exact value in the generated environment README. A key from `.failed`, an older generation, or another environment will not authenticate:
+
+```powershell
+ssh-keygen -lf ".\$($EnvironmentName)_ssh.pem"
+```
+
+On Windows, the file owner can restrict a copied key without administrator privileges:
+
+```powershell
+$KeyPath = (Resolve-Path ".\$($EnvironmentName)_ssh.pem").Path
+$CurrentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+icacls.exe $KeyPath /inheritance:r /grant:r "*${CurrentSid}:(R)"
+```
+
 Remote SSH uses port `22`; remote RDP uses internal port `3389`. No inbound SSH, RDP, Cloudflare, or WireGuard port needs to be opened on the Docker host. The Tunnel initiates its connection outbound. If an egress firewall filters traffic, allow outbound HTTPS and Cloudflare Tunnel traffic, including TCP and UDP `7844`.
 
 ## Verify Cloudflare routing
@@ -458,6 +483,17 @@ Open [Cloudflare's client status page](https://help.teams.cloudflare.com/) and c
 Do not use `ping` as the main health check. ICMP is optional and may fail even when RDP and SSH work. Use the two TCP tests above instead of ping to verify TCP reachability; successful tests do not by themselves verify SSH authentication or that an XRDP desktop session can start.
 
 ## Troubleshooting Cloudflare remote access
+
+### `Permission denied (publickey)`
+
+First copy the exact SSH command from the generated environment README and add `-vvv`. Check these values before changing the server:
+
+- The username is only the generated Linux account name.
+- `IdentitiesOnly=yes` is enabled and `IdentityFile` points to the current PEM.
+- `ssh-keygen -lf <pem>` matches the fingerprint in the generated README.
+- The copied PEM is restricted with the Windows `icacls` or macOS/Linux `chmod 600` command above.
+
+If the server log says `Invalid user ssh <account>`, the client sent `ssh <account>` as the username. This fails before the public key is examined. Correct the VS Code/GUI `User` field; do not rotate the key, enable password login, disable `StrictModes`, or loosen `AllowUsers`.
 
 ### `Enrollment request is invalid`
 

@@ -12,6 +12,45 @@ __REMOTE_CONNECTION_ROWS__
 
 SSH accepts only the generated private key. Keep `__SSH_PRIVATE_KEY__` private; its fingerprint is `__SSH_FINGERPRINT__`. After copying it to macOS/Linux, run `chmod 600` on the copy. The account password entered during creation is used for RDP and `sudo`, but it is not stored in either RDP file.
 
+### SSH client fields
+
+Run a complete `ssh ...` command from the table above in a terminal. In VS Code Remote - SSH or another graphical SSH client, enter the command's parts in separate fields:
+
+- **Host / HostName:** copy only the address before `:` from the target column; do not include the port.
+- **User / Username:** `__ACCOUNT_NAME__` only. Do not enter `ssh __ACCOUNT_NAME__`, `__ACCOUNT_NAME__@host`, or the complete command.
+- **Port:** copy the number after `:` from the target column; remote SSH uses port `22`.
+- **Identity file / Private key:** the current copy of `__SSH_PRIVATE_KEY__`.
+- **IdentitiesOnly:** `yes`.
+
+An OpenSSH or VS Code Remote - SSH config entry has this form:
+
+```sshconfig
+Host __ENVIRONMENT_NAME__
+    HostName <target-address-from-table>
+    User __ACCOUNT_NAME__
+    Port <target-port-from-table>
+    IdentityFile <absolute-path-to-private-key>
+    IdentitiesOnly yes
+```
+
+Confirm that the copied PEM is the current environment key:
+
+```text
+ssh-keygen -lf "__SSH_PRIVATE_KEY__"
+```
+
+The fingerprint must be `__SSH_FINGERPRINT__`. Do not use a key under `.failed`, from a previous generation, or from another environment.
+
+On Windows, the owner of a copied PEM can restrict it without administrator privileges in PowerShell:
+
+```powershell
+$KeyPath = (Resolve-Path '__SSH_PRIVATE_KEY__').Path
+$CurrentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+icacls.exe $KeyPath /inheritance:r /grant:r "*${CurrentSid}:(R)"
+```
+
+On macOS/Linux, run `chmod 600 "__SSH_PRIVATE_KEY__"`. If `Permission denied (publickey)` remains, add `-vvv` to the exact command from the table. A server log containing `Invalid user ssh __ACCOUNT_NAME__` means the client User field incorrectly includes the `ssh ` command prefix; the key is not checked for an invalid user.
+
 __REMOTE_ACCESS_INSTRUCTIONS__
 
 ## Use Docker

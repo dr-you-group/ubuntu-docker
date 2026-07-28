@@ -127,6 +127,16 @@ stored_public="$(awk 'NF { print $1 " " $2; exit }' "${project_path}/${environme
 authorized_public="$(awk 'NF { print $1 " " $2; exit }' "${project_path}/secrets/ssh_authorized_keys")"
 [[ "${derived_public}" == "${stored_public}" ]] || fail 'SSH public key does not match private key'
 [[ "${derived_public}" == "${authorized_public}" ]] || fail 'authorized_keys does not match private key'
+ssh_fingerprint="$(ssh-keygen -l -E sha256 -f "${project_path}/${environment_name}_ssh.pub" | awk '{print $2}')"
+
+grep -Fqx -- '- **User / Username:** `ciuser` only. Do not enter `ssh ciuser`, `ciuser@host`, or the complete command.' \
+    "${project_path}/README.md" || fail 'Generated README does not separate the SSH username from the command'
+grep -Fqx -- '    User ciuser' "${project_path}/README.md" ||
+    fail 'Generated README OpenSSH config has the wrong user'
+grep -Fqx -- 'ssh-keygen -lf "ci-environment_ssh.pem"' "${project_path}/README.md" ||
+    fail 'Generated README does not include the SSH fingerprint command'
+grep -Fq -- "The fingerprint must be \`${ssh_fingerprint}\`" "${project_path}/README.md" ||
+    fail 'Generated README does not identify the current SSH key fingerprint'
 
 tr -d '\r' <"${project_path}/${environment_name}_local.rdp" |
     grep -Fqx -- "full address:s:${host_address}:${rdp_port}" || fail 'Local RDP target is wrong'

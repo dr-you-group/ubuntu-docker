@@ -1519,6 +1519,51 @@ wait_until_healthy() {
     die "Environment did not become healthy within 600 seconds: ${project_path}"
 }
 
+verify_ssh_key_authentication() {
+    local host_address="$1"
+    local ssh_port="$2"
+    local account_name="$3"
+    local private_key="$4"
+    local fingerprint="$5"
+    local probe_directory empty_config known_hosts attempt ssh_error=''
+
+    probe_directory="$(mktemp -d "${TMPDIR:-/tmp}/ubuntu-dind-ssh-probe.XXXXXX")" ||
+        die 'Could not create a temporary directory for the SSH authentication probe.'
+    empty_config="${probe_directory}/config"
+    known_hosts="${probe_directory}/known_hosts"
+    install -m 0600 /dev/null "${empty_config}"
+    install -m 0600 /dev/null "${known_hosts}"
+
+    for attempt in 1 2 3; do
+        if ssh_error="$(ssh \
+            -F "${empty_config}" \
+            -T \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o IdentityAgent=none \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o StrictHostKeyChecking=no \
+            -o "UserKnownHostsFile=${known_hosts}" \
+            -o "GlobalKnownHostsFile=${known_hosts}" \
+            -o LogLevel=ERROR \
+            -o ConnectTimeout=10 \
+            -o ConnectionAttempts=1 \
+            -i "${private_key}" \
+            -p "${ssh_port}" \
+            "${account_name}@${host_address}" \
+            true 2>&1)"; then
+            rm -rf -- "${probe_directory}"
+            info "Verified SSH public-key authentication for ${account_name}@${host_address}:${ssh_port} (${fingerprint})."
+            return 0
+        fi
+        (( attempt == 3 )) || sleep 2
+    done
+
+    rm -rf -- "${probe_directory}"
+    die "Generated SSH public-key authentication failed for ${account_name}@${host_address}:${ssh_port} (${fingerprint}): ${ssh_error}"
+}
+
 expand_template_line() {
     local remaining="$1"
     local output='' key needle prefix best_key best_needle
@@ -2631,7 +2676,7 @@ main() {
 
     parse_arguments "$@"
 
-    for command_name in docker flock ip ss awk grep find stat realpath tar cksum nproc base64 wc tr ssh-keygen install mktemp; do
+    for command_name in docker flock ip ss awk grep find stat realpath tar cksum nproc base64 wc tr ssh ssh-keygen install mktemp; do
         command -v "${command_name}" >/dev/null 2>&1 || die "Required command is missing: ${command_name}"
     done
     docker info >/dev/null 2>&1 || die 'Docker Engine is unavailable or the current user cannot access it.'
@@ -2761,6 +2806,12 @@ main() {
     compose_in "${TARGET_PATH}" up -d
     NEW_STARTED='1'
     wait_until_healthy "${TARGET_PATH}"
+    verify_ssh_key_authentication \
+        '127.0.0.1' \
+        "${SSH_PORT}" \
+        "${ACCOUNT_NAME}" \
+        "${TARGET_PATH}/${SSH_PRIVATE_KEY_FILE}" \
+        "${SSH_KEY_FINGERPRINT}"
     if [[ "${REMOTE_ACCESS_PROVIDER}" == wireguard ]]; then
         export_wireguard_outputs "${TARGET_PATH}"
     fi

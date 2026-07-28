@@ -1974,6 +1974,114 @@ function Wait-EnvironmentHealthy {
     throw "환경이 제한 시간 안에 healthy가 되지 않았습니다: $ProjectPath"
 }
 
+function Get-SshAuthenticationProbeArguments {
+    param(
+        [Parameter(Mandatory)] [string]$HostAddress,
+        [Parameter(Mandatory)] [int]$SshPort,
+        [Parameter(Mandatory)] [string]$AccountName,
+        [Parameter(Mandatory)] [string]$PrivateKeyPath,
+        [Parameter(Mandatory)] [string]$ConfigPath,
+        [Parameter(Mandatory)] [string]$KnownHostsPath
+    )
+
+    $normalizedConfigPath = $ConfigPath -replace '\\', '/'
+    $normalizedKnownHostsPath = $KnownHostsPath -replace '\\', '/'
+    $normalizedPrivateKeyPath = $PrivateKeyPath -replace '\\', '/'
+    return @(
+        '-F', $normalizedConfigPath,
+        '-T',
+        '-o', 'BatchMode=yes',
+        '-o', 'IdentitiesOnly=yes',
+        '-o', 'IdentityAgent=none',
+        '-o', 'PasswordAuthentication=no',
+        '-o', 'KbdInteractiveAuthentication=no',
+        '-o', 'StrictHostKeyChecking=no',
+        '-o', "UserKnownHostsFile=$normalizedKnownHostsPath",
+        '-o', "GlobalKnownHostsFile=$normalizedKnownHostsPath",
+        '-o', 'LogLevel=ERROR',
+        '-o', 'ConnectTimeout=10',
+        '-o', 'ConnectionAttempts=1',
+        '-i', $normalizedPrivateKeyPath,
+        '-p', [string]$SshPort,
+        "$AccountName@$HostAddress",
+        'true'
+    )
+}
+
+function Assert-SshKeyAuthentication {
+    param(
+        [Parameter(Mandatory)] [string]$HostAddress,
+        [Parameter(Mandatory)] [int]$SshPort,
+        [Parameter(Mandatory)] [string]$AccountName,
+        [Parameter(Mandatory)] [string]$PrivateKeyPath,
+        [Parameter(Mandatory)] [string]$Fingerprint,
+        [string]$SshClientPath = '',
+        [ValidateRange(0, 60)] [int]$RetryDelaySeconds = 2
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SshClientPath)) {
+        $sshClient = Get-Command ssh.exe -ErrorAction SilentlyContinue
+        if ($null -eq $sshClient) {
+            throw 'ssh.exe를 찾을 수 없습니다. Windows OpenSSH Client를 설치하십시오.'
+        }
+        $sshExecutable = $sshClient.Source
+    }
+    else {
+        if (-not (Test-Path -LiteralPath $SshClientPath -PathType Leaf)) {
+            throw "SSH client executable을 찾을 수 없습니다: $SshClientPath"
+        }
+        $sshExecutable = [IO.Path]::GetFullPath($SshClientPath)
+    }
+
+    $probeDirectory = Join-Path ([IO.Path]::GetTempPath()) (
+        'ubuntu-dind-ssh-probe-' + [Guid]::NewGuid().ToString('N')
+    )
+    $null = [IO.Directory]::CreateDirectory($probeDirectory)
+    $emptyConfigPath = Join-Path $probeDirectory 'config'
+    $knownHostsPath = Join-Path $probeDirectory 'known_hosts'
+    [IO.File]::WriteAllText($emptyConfigPath, '', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($knownHostsPath, '', [Text.UTF8Encoding]::new($false))
+
+    try {
+        $probeArguments = @(Get-SshAuthenticationProbeArguments `
+                -HostAddress $HostAddress `
+                -SshPort $SshPort `
+                -AccountName $AccountName `
+                -PrivateKeyPath $PrivateKeyPath `
+                -ConfigPath $emptyConfigPath `
+                -KnownHostsPath $knownHostsPath)
+        $lastSshError = ''
+
+        foreach ($attempt in 1..3) {
+            $previousErrorActionPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $sshOutput = @(& $sshExecutable @probeArguments 2>&1)
+                $sshExitCode = $LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+
+            if ($sshExitCode -eq 0) {
+                Write-Host "SSH public-key 인증 확인 완료: ${AccountName}@${HostAddress}:$SshPort ($Fingerprint)"
+                return
+            }
+            $lastSshError = ($sshOutput | Out-String).Trim()
+            if ($attempt -lt 3) {
+                Start-Sleep -Seconds $RetryDelaySeconds
+            }
+        }
+
+        throw "생성된 SSH public-key 인증에 실패했습니다: ${AccountName}@${HostAddress}:$SshPort ($Fingerprint). $lastSshError"
+    }
+    finally {
+        if (Test-Path -LiteralPath $probeDirectory) {
+            [IO.Directory]::Delete($probeDirectory, $true)
+        }
+    }
+}
+
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     throw 'Docker CLI를 찾을 수 없습니다. Docker Desktop 또는 Docker Engine 28.0.0 이상을 설치하고 실행하십시오.'
 }
@@ -1982,6 +2090,9 @@ Assert-DockerComposeVersion
 
 if ([string]::IsNullOrWhiteSpace($RootPath)) {
     $RootPath = $PSScriptRoot
+}
+if (-not (Get-Command ssh.exe -ErrorAction SilentlyContinue)) {
+    throw 'ssh.exe를 찾을 수 없습니다. Windows OpenSSH Client를 설치하십시오.'
 }
 if ([string]::IsNullOrWhiteSpace($RootPath)) {
     throw '루트 경로를 확인할 수 없습니다. -RootPath로 경로를 지정하십시오.'
@@ -3312,6 +3423,12 @@ Verify a nonzero handshake timestamp with `docker compose exec -T wireguard wg s
         @('desktop', 'docker', 'wireguard', 'remote_proxy')
     }
     Wait-EnvironmentHealthy -ProjectPath $targetPath -ServiceNames $healthServices
+    Assert-SshKeyAuthentication `
+        -HostAddress '127.0.0.1' `
+        -SshPort $SshPort `
+        -AccountName $AccountName `
+        -PrivateKeyPath $targetSshPrivateKeyPath `
+        -Fingerprint $sshKeyFingerprint
 
     if ($RemoteAccessProvider -eq 'wireguard') {
     Export-WireGuardOutputs `

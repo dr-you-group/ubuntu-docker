@@ -11,10 +11,13 @@ readonly success_root="${temporary_root}/success-output"
 readonly failure_root="${temporary_root}/failure-output"
 readonly api_log="${temporary_root}/cloudflare-api.log"
 readonly docker_log="${temporary_root}/docker.log"
+readonly ssh_log="${temporary_root}/ssh.log"
 readonly success_log="${temporary_root}/success.log"
 readonly failure_log="${temporary_root}/failure.log"
+readonly auth_failure_log="${temporary_root}/auth-failure.log"
 readonly environment_name='ci-cloudflare'
 readonly failure_environment_name='ci-cloudflare-rollback'
+readonly auth_failure_environment_name='ci-cloudflare-ssh-failure'
 readonly account_name='ciuser'
 readonly password_value='CI-only-password-2026!'
 readonly management_token='CI_DUMMY_MANAGEMENT_TOKEN_0123456789'
@@ -121,6 +124,69 @@ case "${1:-}" in
 esac
 FAKE_DOCKER
 chmod 0755 "${fake_bin}/docker"
+
+cat >"${fake_bin}/ssh" <<'FAKE_SSH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+config_path=''
+known_hosts_path=''
+identity_path=''
+port=''
+declare -a positional=()
+declare -a options=()
+
+while (($#)); do
+    case "$1" in
+        -F) config_path="$2"; shift 2 ;;
+        -i) identity_path="$2"; shift 2 ;;
+        -p) port="$2"; shift 2 ;;
+        -o)
+            options+=("$2")
+            case "$2" in
+                UserKnownHostsFile=*) known_hosts_path="${2#*=}" ;;
+            esac
+            shift 2
+            ;;
+        -T) shift ;;
+        *) positional+=("$1"); shift ;;
+    esac
+done
+
+has_option() {
+    local expected="$1" option
+    for option in "${options[@]}"; do
+        [[ "${option}" != "${expected}" ]] || return 0
+    done
+    return 1
+}
+
+[[ -f "${config_path}" && ! -s "${config_path}" ]] || exit 74
+[[ -f "${known_hosts_path}" && ! -s "${known_hosts_path}" ]] || exit 75
+[[ "${identity_path}" == "${FAKE_SSH_EXPECTED_KEY:?}" ]] || exit 76
+[[ "${port}" == "${FAKE_SSH_EXPECTED_PORT:?}" ]] || exit 77
+[[ ${#positional[@]} -eq 2 ]] || exit 78
+[[ "${positional[0]}" == "${FAKE_SSH_EXPECTED_TARGET:?}" ]] || exit 79
+[[ "${positional[1]}" == true ]] || exit 80
+for required_option in \
+    BatchMode=yes \
+    IdentitiesOnly=yes \
+    IdentityAgent=none \
+    PasswordAuthentication=no \
+    KbdInteractiveAuthentication=no \
+    StrictHostKeyChecking=no \
+    ConnectionAttempts=1; do
+    has_option "${required_option}" || exit 81
+done
+
+printf '%s|%s|%s\n' "${positional[0]}" "${identity_path}" "${port}" \
+    >>"${FAKE_SSH_LOG:?}"
+if [[ "${FAKE_SSH_MODE:-success}" == failure ]]; then
+    printf 'synthetic SSH authentication failure\n' >&2
+    exit 82
+fi
+FAKE_SSH
+chmod 0755 "${fake_bin}/ssh"
 
 cat >"${fake_bin}/ip" <<'FAKE_IP'
 #!/usr/bin/env bash
@@ -270,8 +336,14 @@ export FAKE_CLOUDFLARE_TUNNEL_ID="${tunnel_id}"
 export FAKE_CLOUDFLARE_ROUTE_ID="${route_id}"
 export FAKE_CLOUDFLARE_PRIVATE_IP="${private_ip}"
 export FAKE_CLOUDFLARE_MODE='success'
+export FAKE_SSH_LOG="${ssh_log}"
+export FAKE_SSH_EXPECTED_KEY="${success_root}/${environment_name}/${environment_name}_ssh.pem"
+export FAKE_SSH_EXPECTED_PORT="${ssh_port}"
+export FAKE_SSH_EXPECTED_TARGET="${account_name}@127.0.0.1"
+export FAKE_SSH_MODE='success'
 : >"${api_log}"
 : >"${docker_log}"
+: >"${ssh_log}"
 
 if ! printf '%s\n' "${password_value}" | PATH="${fake_bin}:${PATH}" \
     "${fixture_repo}/new_ubuntu_dind_environment.sh" \
@@ -302,6 +374,12 @@ if ! printf '%s\n' "${password_value}" | PATH="${fake_bin}:${PATH}" \
     sed -n '1,160p' "${success_log}" >&2
     fail 'Cloudflare generation failed against the fake API'
 fi
+
+expected_ssh_probe="${account_name}@127.0.0.1|${success_root}/${environment_name}/${environment_name}_ssh.pem|${ssh_port}"
+[[ "$(<"${ssh_log}")" == "${expected_ssh_probe}" ]] ||
+    fail 'Generator did not probe SSH with the exact account, key, host, and port'
+grep -Fq -- 'Verified SSH public-key authentication' "${success_log}" ||
+    fail 'Generator did not report successful SSH public-key authentication'
 
 project_path="${success_root}/${environment_name}"
 [[ -d "${project_path}" ]] || fail 'Cloudflare generator did not create the project directory'
@@ -457,5 +535,70 @@ for call in "${failure_api_calls[@]}"; do
     [[ "${call}" != $'DELETE\t/teamnet/routes/'* ]] ||
         fail 'Rollback tried to delete a route that Cloudflare never created'
 done
+
+# An authentication failure happens after the generated target is swapped in and
+# both Cloudflare resources exist. It must retry exactly three times, stop and
+# preserve the failed target, and delete the route before its Tunnel.
+export FAKE_CLOUDFLARE_MODE='success'
+export FAKE_SSH_MODE='failure'
+export FAKE_SSH_EXPECTED_KEY="${failure_root}/${auth_failure_environment_name}/${auth_failure_environment_name}_ssh.pem"
+: >"${api_log}"
+: >"${docker_log}"
+: >"${ssh_log}"
+if printf '%s\n' "${password_value}" | PATH="${fake_bin}:${PATH}" \
+    "${fixture_repo}/new_ubuntu_dind_environment.sh" \
+    --environment "${auth_failure_environment_name}" \
+    --account "${account_name}" \
+    --password-stdin \
+    --uid 1001 \
+    --gid 1001 \
+    --root "${failure_root}" \
+    --host-address "${host_address}" \
+    --remote-subnet "${remote_subnet}" \
+    --ssh-port "${ssh_port}" \
+    --rdp-port "${rdp_port}" \
+    --remote-access-provider cloudflare \
+    --desktop-cpus -1 \
+    --desktop-memory -1 \
+    --dind-cpus -1 \
+    --dind-memory -1 \
+    --docker-version 28.5.1 \
+    --gpu off \
+    --skip-firewall \
+    >"${auth_failure_log}" 2>&1; then
+    fail 'Synthetic SSH authentication failure unexpectedly succeeded'
+fi
+
+[[ "$(wc -l <"${ssh_log}")" -eq 3 ]] ||
+    fail 'SSH authentication failure did not retry exactly three times'
+while IFS= read -r ssh_attempt; do
+    expected_auth_failure_probe="${account_name}@127.0.0.1|${failure_root}/${auth_failure_environment_name}/${auth_failure_environment_name}_ssh.pem|${ssh_port}"
+    [[ "${ssh_attempt}" == "${expected_auth_failure_probe}" ]] ||
+        fail 'SSH authentication retry changed its account, key, host, or port'
+done <"${ssh_log}"
+grep -Fq -- 'Generated SSH public-key authentication failed' "${auth_failure_log}" ||
+    fail 'SSH authentication failure did not report the probe error'
+[[ ! -e "${failure_root}/${auth_failure_environment_name}" ]] ||
+    fail 'SSH authentication failure left the target directory active'
+mapfile -t preserved_auth_failures < <(
+    find "${failure_root}/.failed" -mindepth 1 -maxdepth 1 -type d \
+        -name "${auth_failure_environment_name}.*" -print
+)
+[[ ${#preserved_auth_failures[@]} -eq 1 ]] ||
+    fail 'SSH authentication failure was not preserved exactly once under .failed'
+[[ -f "${preserved_auth_failures[0]}/secrets/cloudflared_tunnel_token" ]] ||
+    fail 'Preserved SSH authentication failure is incomplete'
+grep -Fq -- 'compose --env-file .env down --remove-orphans' "${docker_log}" ||
+    fail 'SSH authentication failure did not stop the failed Compose project'
+! grep -Fq -- "${management_token}" "${auth_failure_log}" ||
+    fail 'Management API token leaked into SSH authentication failure output'
+
+mapfile -t auth_failure_api_calls <"${api_log}"
+[[ ${#auth_failure_api_calls[@]} -eq 9 ]] ||
+    fail "expected 9 SSH-auth-failure API calls, got ${#auth_failure_api_calls[@]}"
+[[ "${auth_failure_api_calls[7]}" == $'DELETE\t/teamnet/routes/'"${route_id}" ]] ||
+    fail 'SSH authentication rollback did not delete its private route first'
+[[ "${auth_failure_api_calls[8]}" == $'DELETE\t/cfd_tunnel/'"${tunnel_id}" ]] ||
+    fail 'SSH authentication rollback did not delete its Tunnel second'
 
 printf 'Cloudflare generator smoke and transactional rollback tests passed.\n'

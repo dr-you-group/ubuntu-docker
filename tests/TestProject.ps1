@@ -112,6 +112,8 @@ $FunctionNames = @(
     'Test-WireGuardEndpoint',
     'Test-WireGuardPublicKey',
     'Test-MemoryValue',
+    'Get-SshAuthenticationProbeArguments',
+    'Assert-SshKeyAuthentication',
     'Expand-TemplateFile',
     'Assert-DockerComposeVersion',
     'Assert-DockerEngineVersion'
@@ -173,6 +175,111 @@ Assert-True (Test-MemoryValue '4096m') 'memory in MiB'
 Assert-True (Test-MemoryValue '4G') 'memory in GiB'
 Assert-False (Test-MemoryValue '4096') 'unitless memory rejection'
 Assert-False (Test-MemoryValue '-1') 'special unlimited value is handled outside memory parser'
+
+$ProbeArguments = @(Get-SshAuthenticationProbeArguments `
+        -HostAddress '192.0.2.10' `
+        -SshPort 49222 `
+        -AccountName 'ciuser' `
+        -PrivateKeyPath 'C:\probe\ci_ssh.pem' `
+        -ConfigPath 'C:\probe\config' `
+        -KnownHostsPath 'C:\probe\known_hosts')
+$ConfigIndex = [Array]::IndexOf([array]$ProbeArguments, '-F')
+$IdentityIndex = [Array]::IndexOf([array]$ProbeArguments, '-i')
+$PortIndex = [Array]::IndexOf([array]$ProbeArguments, '-p')
+Assert-True ($ConfigIndex -ge 0) 'SSH probe isolates the client config'
+Assert-True ($IdentityIndex -ge 0) 'SSH probe selects the generated identity'
+Assert-True ($PortIndex -ge 0) 'SSH probe selects the published port'
+Assert-Equal 'C:/probe/config' $ProbeArguments[$ConfigIndex + 1] 'SSH probe normalized config path'
+Assert-Equal 'C:/probe/ci_ssh.pem' $ProbeArguments[$IdentityIndex + 1] 'SSH probe private key path'
+Assert-Equal '49222' $ProbeArguments[$PortIndex + 1] 'SSH probe port'
+Assert-Equal 'ciuser@192.0.2.10' $ProbeArguments[$ProbeArguments.Count - 2] 'SSH probe exact user and host'
+Assert-Equal 'true' $ProbeArguments[$ProbeArguments.Count - 1] 'SSH probe remote command'
+Assert-False ($ProbeArguments -contains 'ssh ciuser@192.0.2.10') 'SSH probe never prefixes the username with ssh'
+foreach ($RequiredOption in @(
+        'BatchMode=yes',
+        'IdentitiesOnly=yes',
+        'IdentityAgent=none',
+        'PasswordAuthentication=no',
+        'KbdInteractiveAuthentication=no',
+        'StrictHostKeyChecking=no',
+        'ConnectionAttempts=1'
+    )) {
+    Assert-True ($ProbeArguments -contains $RequiredOption) "SSH probe option $RequiredOption"
+}
+
+$ProbeTempPath = [IO.Path]::GetTempPath()
+$ProbeDirectoriesBefore = @(
+    Get-ChildItem -LiteralPath $ProbeTempPath -Directory -Filter 'ubuntu-dind-ssh-probe-*' -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty FullName
+)
+$FakeSshRoot = Join-Path $ProbeTempPath ('ubuntu-dind-fake-ssh-' + [Guid]::NewGuid().ToString('N'))
+$null = [IO.Directory]::CreateDirectory($FakeSshRoot)
+$FakeSshPath = Join-Path $FakeSshRoot 'ssh.cmd'
+$FakeSshLog = Join-Path $FakeSshRoot 'ssh.log'
+$FakeSshScript = @'
+@echo off
+echo %*>>"%FAKE_SSH_LOG%"
+if /I "%FAKE_SSH_MODE%"=="failure" (
+    echo synthetic SSH authentication failure 1>&2
+    exit /b 82
+)
+exit /b 0
+'@
+[IO.File]::WriteAllText($FakeSshPath, $FakeSshScript, [Text.Encoding]::ASCII)
+
+try {
+    $env:FAKE_SSH_LOG = $FakeSshLog
+    $env:FAKE_SSH_MODE = 'success'
+    Assert-SshKeyAuthentication `
+        -HostAddress '127.0.0.1' `
+        -SshPort 49222 `
+        -AccountName 'ciuser' `
+        -PrivateKeyPath 'C:\probe\ci_ssh.pem' `
+        -Fingerprint 'SHA256:ci-test' `
+        -SshClientPath $FakeSshPath `
+        -RetryDelaySeconds 0
+
+    $SuccessfulProbeLines = @(Get-Content -LiteralPath $FakeSshLog)
+    Assert-Equal 1 $SuccessfulProbeLines.Count 'Windows SSH probe succeeds on its first valid authentication'
+    Assert-True ($SuccessfulProbeLines[0].Contains('ciuser@127.0.0.1')) 'Windows SSH probe sends the exact username'
+    Assert-True ($SuccessfulProbeLines[0].Contains('IdentityAgent=none')) 'Windows SSH probe bypasses ssh-agent'
+
+    $env:FAKE_SSH_MODE = 'failure'
+    $SshProbeFailure = $null
+    try {
+        Assert-SshKeyAuthentication `
+            -HostAddress '127.0.0.1' `
+            -SshPort 49222 `
+            -AccountName 'ciuser' `
+            -PrivateKeyPath 'C:\probe\ci_ssh.pem' `
+            -Fingerprint 'SHA256:ci-test' `
+            -SshClientPath $FakeSshPath `
+            -RetryDelaySeconds 0
+    }
+    catch {
+        $SshProbeFailure = $_.Exception
+    }
+    Assert-True ($null -ne $SshProbeFailure) 'Windows SSH probe fails after rejected authentication'
+    Assert-True (
+        $SshProbeFailure.Message.Contains('synthetic SSH authentication failure')
+    ) 'Windows SSH probe preserves the native client failure reason'
+    $AllProbeLines = @(Get-Content -LiteralPath $FakeSshLog)
+    Assert-Equal 4 $AllProbeLines.Count 'Windows SSH probe makes one success call and three failure attempts'
+}
+finally {
+    Remove-Item Env:\FAKE_SSH_LOG -ErrorAction SilentlyContinue
+    Remove-Item Env:\FAKE_SSH_MODE -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $FakeSshRoot) {
+        [IO.Directory]::Delete($FakeSshRoot, $true)
+    }
+}
+
+$ProbeDirectoriesAfter = @(
+    Get-ChildItem -LiteralPath $ProbeTempPath -Directory -Filter 'ubuntu-dind-ssh-probe-*' -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty FullName
+)
+$LeakedProbeDirectories = @($ProbeDirectoriesAfter | Where-Object { $ProbeDirectoriesBefore -notcontains $_ })
+Assert-Equal 0 $LeakedProbeDirectories.Count 'Windows SSH probe removes temporary config and known-hosts files'
 
 $script:MockDockerOutput = ''
 $script:MockDockerExitCode = 0
@@ -593,6 +700,7 @@ finally {
 $SshConfig = [IO.File]::ReadAllText((Join-Path $RepoRoot 'templates\ubuntu-dind\ssh-container.conf'))
 foreach ($RequiredLine in @(
         'PubkeyAuthentication yes',
+        'StrictModes yes',
         'PasswordAuthentication no',
         'KbdInteractiveAuthentication no',
         'AuthenticationMethods publickey',
@@ -602,7 +710,46 @@ foreach ($RequiredLine in @(
 }
 Assert-False ($SshConfig.Contains('PasswordAuthentication yes')) 'password SSH authentication remains disabled'
 
+$GeneratedReadmeTemplate = [IO.File]::ReadAllText(
+    (Join-Path $RepoRoot 'templates\ubuntu-dind\README.md.template')
+)
+foreach ($RequiredText in @(
+        '- **User / Username:** `__ACCOUNT_NAME__` only.',
+        'Do not enter `ssh __ACCOUNT_NAME__`',
+        '    User __ACCOUNT_NAME__',
+        'ssh-keygen -lf "__SSH_PRIVATE_KEY__"',
+        'icacls.exe $KeyPath /inheritance:r /grant:r "*${CurrentSid}:(R)"',
+        'Invalid user ssh __ACCOUNT_NAME__'
+    )) {
+    Assert-True ($GeneratedReadmeTemplate.Contains($RequiredText)) "generated SSH README text $RequiredText"
+}
+
+$GeneratorText = [IO.File]::ReadAllText($GeneratorPath)
+Assert-True ($GeneratorText.Contains('Assert-SshKeyAuthentication `')) 'PowerShell generator runs the SSH key-authentication probe'
+Assert-True (
+    $GeneratorText.Contains("-HostAddress '127.0.0.1'")
+) 'PowerShell generator probes the loopback-only SSH publication'
+Assert-True (
+    $GeneratorText.Contains('"$AccountName@$HostAddress"')
+) 'PowerShell SSH probe uses only the generated account name'
+
 $DesktopEntrypoint = [IO.File]::ReadAllText((Join-Path $RepoRoot 'templates\ubuntu-dind\docker_entrypoint.sh'))
+foreach ($RequiredCheck in @(
+        "grep -qx 'strictmodes yes'",
+        "grep -qx 'pubkeyauthentication yes'",
+        "grep -qx 'permitrootlogin no'",
+        'grep -qx "allowusers ${account_name}"'
+    )) {
+    Assert-True ($DesktopEntrypoint.Contains($RequiredCheck)) "effective SSH check $RequiredCheck"
+}
+foreach ($RequiredKeyHandling in @(
+        'mapfile -t authorized_key_lines',
+        'if (( ${#authorized_key_lines[@]} != 1 )); then',
+        'canonical_authorized_key="${authorized_key_type} ${authorized_key_blob}"',
+        'install -m 0644 -o root -g root /dev/null "${installed_authorized_key}"'
+    )) {
+    Assert-True ($DesktopEntrypoint.Contains($RequiredKeyHandling)) "authorized key handling $RequiredKeyHandling"
+}
 Assert-True (
     $DesktopEntrypoint -match '(?m)^\s*chmod 0777 "\$\{account_home\}" /workspace\r?$'
 ) 'Windows bind roots are explicitly made writable'

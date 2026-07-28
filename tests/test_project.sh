@@ -127,6 +127,7 @@ expect_failure 'Unitless memory rejected' normalise_memory_value '4096'
 
 readonly ssh_config="${repo_root}/templates/ubuntu-dind/ssh-container.conf"
 assert_file_contains "${ssh_config}" 'PubkeyAuthentication yes'
+assert_file_contains "${ssh_config}" 'StrictModes yes'
 assert_file_contains "${ssh_config}" 'PasswordAuthentication no'
 assert_file_contains "${ssh_config}" 'KbdInteractiveAuthentication no'
 assert_file_contains "${ssh_config}" 'AuthenticationMethods publickey'
@@ -134,6 +135,14 @@ assert_file_contains "${ssh_config}" 'PermitRootLogin no'
 assert_file_not_contains "${ssh_config}" 'PasswordAuthentication yes'
 
 readonly desktop_entrypoint="${repo_root}/templates/ubuntu-dind/docker_entrypoint.sh"
+assert_file_contains "${desktop_entrypoint}" 'grep -qx '\''strictmodes yes'\'' <<<"${effective_sshd_config}"'
+assert_file_contains "${desktop_entrypoint}" 'grep -qx '\''pubkeyauthentication yes'\'' <<<"${effective_sshd_config}"'
+assert_file_contains "${desktop_entrypoint}" 'grep -qx '\''permitrootlogin no'\'' <<<"${effective_sshd_config}"'
+assert_file_contains "${desktop_entrypoint}" 'grep -qx "allowusers ${account_name}" <<<"${effective_sshd_config}"'
+assert_file_contains "${desktop_entrypoint}" 'mapfile -t authorized_key_lines < <(awk '\''NF { print }'\'' "${authorized_keys_file}")'
+assert_file_contains "${desktop_entrypoint}" 'if (( ${#authorized_key_lines[@]} != 1 )); then'
+assert_file_contains "${desktop_entrypoint}" 'canonical_authorized_key="${authorized_key_type} ${authorized_key_blob}"'
+assert_file_contains "${desktop_entrypoint}" 'install -m 0644 -o root -g root /dev/null "${installed_authorized_key}"'
 assert_file_contains "${desktop_entrypoint}" '    chmod 0777 "${account_home}" /workspace'
 assert_file_contains "${desktop_entrypoint}" '    chown "${account_uid}:${account_gid}" "${account_home}" /workspace'
 assert_file_contains "${desktop_entrypoint}" '    "${account_home}/.docker" \'
@@ -147,6 +156,17 @@ writable_check_line="$(grep -n -F -- 'for writable_path in "${account_home}" "${
 (( home_initialization_line < home_permission_line && home_permission_line < writable_check_line )) ||
     fail 'Desktop home permissions must be restored after skeleton initialization and before writability checks'
 
+readonly generated_readme_template="${repo_root}/templates/ubuntu-dind/README.md.template"
+assert_file_contains "${generated_readme_template}" '- **User / Username:** `__ACCOUNT_NAME__` only. Do not enter `ssh __ACCOUNT_NAME__`, `__ACCOUNT_NAME__@host`, or the complete command.'
+assert_file_contains "${generated_readme_template}" '    User __ACCOUNT_NAME__'
+assert_file_contains "${generated_readme_template}" 'ssh-keygen -lf "__SSH_PRIVATE_KEY__"'
+assert_file_contains "${generated_readme_template}" 'icacls.exe $KeyPath /inheritance:r /grant:r "*${CurrentSid}:(R)"'
+assert_file_contains "${generated_readme_template}" 'On macOS/Linux, run `chmod 600 "__SSH_PRIVATE_KEY__"`. If `Permission denied (publickey)` remains, add `-vvv` to the exact command from the table. A server log containing `Invalid user ssh __ACCOUNT_NAME__` means the client User field incorrectly includes the `ssh ` command prefix; the key is not checked for an invalid user.'
+
+grep -Fq -- 'verify_ssh_key_authentication \' "${generator}" ||
+    fail 'Linux generator does not run the SSH public-key authentication probe'
+assert_file_contains "${generator}" "        '127.0.0.1' \\"
+assert_file_contains "${generator}" '            "${account_name}@${host_address}" \'
 readonly xrdp_startwm="${repo_root}/templates/ubuntu-dind/xrdp_startwm.sh"
 assert_file_contains "${xrdp_startwm}" 'export LANG="${LANG:-en_US.UTF-8}"'
 

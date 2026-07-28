@@ -635,7 +635,34 @@ Assert-True (
     $XrdpStartWindowManager.Contains('export LANG="${LANG:-en_US.UTF-8}"')
 ) 'XRDP session has a UTF-8 locale fallback'
 
+$XrdpKoreanKeyboardSetup = [IO.File]::ReadAllText(
+    (Join-Path $RepoRoot 'templates\ubuntu-dind\configure_xrdp_korean_keyboard.sh')
+)
+foreach ($RequiredSetting in @(
+        's/^Key109=.*/Key109=65332:0/',
+        's/^Key113=.*/Key113=65329:0/',
+        'rdp_layout_kr_hangul=0xe0010412',
+        'rdp_layout_kr_hangul=kr',
+        'keyboard_type=8',
+        'keyboard_subtype=1',
+        'model=pc105',
+        'variant=kr106',
+        'options=korean:ralt_hangul,korean:rctrl_hanja',
+        'rdp_layouts=rdp_layouts_kr_hangul',
+        'layouts_map=layouts_map_kr_hangul'
+    )) {
+    Assert-True ($XrdpKoreanKeyboardSetup.Contains($RequiredSetting)) "XRDP Korean setting $RequiredSetting"
+}
+
 $DesktopDockerfile = [IO.File]::ReadAllText((Join-Path $RepoRoot 'templates\ubuntu-dind\Dockerfile'))
+Assert-True (
+    $DesktopDockerfile.Contains(
+        'COPY configure_xrdp_korean_keyboard.sh /usr/local/sbin/configure_xrdp_korean_keyboard.sh'
+    )
+) 'desktop copies the XRDP Korean keyboard setup'
+Assert-True (
+    $DesktopDockerfile.Contains('    && /usr/local/sbin/configure_xrdp_korean_keyboard.sh')
+) 'desktop applies the XRDP Korean keyboard setup'
 Assert-True ($DesktopDockerfile.Contains('        fonts-noto-color-emoji \')) 'desktop installs emoji glyphs'
 Assert-True ($DesktopDockerfile.Contains('        fonts-powerline \')) 'desktop installs Powerline glyphs'
 Assert-True ($DesktopDockerfile.Contains('    && update-locale LANG=en_US.UTF-8 \')) 'desktop persists the UTF-8 locale for PAM sessions'

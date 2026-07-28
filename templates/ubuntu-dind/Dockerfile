@@ -120,12 +120,15 @@ RUN mkdir -p /usr/share/xfce4/backdrops \
 COPY ssh-container.conf /etc/ssh/sshd_config.d/00-docker-vm-container.conf
 COPY xrdp_startwm.sh /etc/xrdp/startwm.sh
 COPY start_xfce_session.sh /usr/local/sbin/start_xfce_session.sh
+COPY configure_xrdp_korean_keyboard.sh /usr/local/sbin/configure_xrdp_korean_keyboard.sh
 COPY supervisord.conf /etc/supervisor/conf.d/docker-vm.conf
 COPY docker_entrypoint.sh /usr/local/sbin/docker_vm_entrypoint.sh
 
 RUN chmod 0755 /etc/xrdp/startwm.sh \
         /usr/local/sbin/start_xfce_session.sh \
-        /usr/local/sbin/docker_vm_entrypoint.sh
+        /usr/local/sbin/configure_xrdp_korean_keyboard.sh \
+        /usr/local/sbin/docker_vm_entrypoint.sh \
+    && /usr/local/sbin/configure_xrdp_korean_keyboard.sh
 
 # 3389 is only the container-internal XRDP port. The generator forbids host port 3389.
 EXPOSE 22 3389

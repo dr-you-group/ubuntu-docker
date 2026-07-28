@@ -150,7 +150,27 @@ writable_check_line="$(grep -n -F -- 'for writable_path in "${account_home}" "${
 readonly xrdp_startwm="${repo_root}/templates/ubuntu-dind/xrdp_startwm.sh"
 assert_file_contains "${xrdp_startwm}" 'export LANG="${LANG:-en_US.UTF-8}"'
 
+readonly xrdp_korean_keyboard_setup="${repo_root}/templates/ubuntu-dind/configure_xrdp_korean_keyboard.sh"
+grep -Fq -- 's/^Key109=.*/Key109=65332:0/' "${xrdp_korean_keyboard_setup}" ||
+    fail 'XRDP Korean setup does not map right Control to Hangul_Hanja'
+grep -Fq -- 's/^Key113=.*/Key113=65329:0/' "${xrdp_korean_keyboard_setup}" ||
+    fail 'XRDP Korean setup does not map right Alt to Hangul'
+for required_setting in \
+    'rdp_layout_kr_hangul=0xe0010412' \
+    'rdp_layout_kr_hangul=kr' \
+    'keyboard_type=8' \
+    'keyboard_subtype=1' \
+    'model=pc105' \
+    'variant=kr106' \
+    'options=korean:ralt_hangul,korean:rctrl_hanja' \
+    'rdp_layouts=rdp_layouts_kr_hangul' \
+    'layouts_map=layouts_map_kr_hangul'; do
+    assert_file_contains "${xrdp_korean_keyboard_setup}" "${required_setting}"
+done
+
 readonly desktop_dockerfile="${repo_root}/templates/ubuntu-dind/Dockerfile"
+assert_file_contains "${desktop_dockerfile}" 'COPY configure_xrdp_korean_keyboard.sh /usr/local/sbin/configure_xrdp_korean_keyboard.sh'
+assert_file_contains "${desktop_dockerfile}" '    && /usr/local/sbin/configure_xrdp_korean_keyboard.sh'
 assert_file_contains "${desktop_dockerfile}" '        fonts-noto-color-emoji \'
 assert_file_contains "${desktop_dockerfile}" '        fonts-powerline \'
 assert_file_contains "${desktop_dockerfile}" '    && update-locale LANG=en_US.UTF-8 \'
@@ -227,5 +247,7 @@ while IFS= read -r tracked_path; do
             ;;
     esac
 done < <(git -C "${repo_root}" ls-files)
+
+bash "${repo_root}/tests/test_xrdp_korean_keyboard.sh"
 
 printf 'Linux static and unit tests passed.\n'

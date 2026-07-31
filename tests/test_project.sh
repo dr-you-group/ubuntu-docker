@@ -156,6 +156,16 @@ writable_check_line="$(grep -n -F -- 'for writable_path in "${account_home}" "${
 (( home_initialization_line < home_permission_line && home_permission_line < writable_check_line )) ||
     fail 'Desktop home permissions must be restored after skeleton initialization and before writability checks'
 
+readonly dind_entrypoint="${repo_root}/templates/ubuntu-dind/dind_entrypoint.sh"
+assert_file_contains "${dind_entrypoint}" '    dockerd|*/dockerd)'
+assert_file_contains "${dind_entrypoint}" '        rm -f /var/run/docker.pid'
+dind_pid_cleanup_line="$(grep -n -F -- 'rm -f /var/run/docker.pid' "${dind_entrypoint}" | cut -d: -f1)"
+dind_exec_line="$(grep -n -F -- 'exec "$@"' "${dind_entrypoint}" | cut -d: -f1)"
+[[ "${dind_pid_cleanup_line}" =~ ^[0-9]+$ && "${dind_exec_line}" =~ ^[0-9]+$ ]] ||
+    fail 'Could not locate DinD PID cleanup and daemon exec steps'
+(( dind_pid_cleanup_line < dind_exec_line )) ||
+    fail 'DinD stale PID cleanup must run before daemon exec'
+
 readonly generated_readme_template="${repo_root}/templates/ubuntu-dind/README.md.template"
 assert_file_contains "${generated_readme_template}" '- **User / Username:** `__ACCOUNT_NAME__` only. Do not enter `ssh __ACCOUNT_NAME__`, `__ACCOUNT_NAME__@host`, or the complete command.'
 assert_file_contains "${generated_readme_template}" '    User __ACCOUNT_NAME__'

@@ -77,4 +77,13 @@ if [[ "${gpu_enabled}" == 1 ]]; then
     fi
 fi
 
+# An abrupt host or Docker Desktop shutdown can leave this file in the
+# container's writable layer. On restart it points at the new entrypoint
+# process (PID 1), so dockerd incorrectly concludes that a daemon is running.
+case "${1:-}" in
+    dockerd|*/dockerd)
+        rm -f /var/run/docker.pid
+        ;;
+esac
+
 exec "$@"

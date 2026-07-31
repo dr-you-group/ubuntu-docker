@@ -777,6 +777,15 @@ Assert-True (
     $WritableCheckIndex -gt $HomePermissionIndex
 ) 'desktop home permissions are restored after skeleton initialization and before writability checks'
 
+$DindEntrypoint = [IO.File]::ReadAllText((Join-Path $RepoRoot 'templates\ubuntu-dind\dind_entrypoint.sh'))
+$DindPidCleanup = 'rm -f /var/run/docker.pid'
+$DindExec = 'exec "$@"'
+$DindPidCleanupIndex = $DindEntrypoint.IndexOf($DindPidCleanup, [StringComparison]::Ordinal)
+$DindExecIndex = $DindEntrypoint.IndexOf($DindExec, [StringComparison]::Ordinal)
+Assert-True ($DindEntrypoint.Contains('dockerd|*/dockerd)')) 'DinD PID cleanup is limited to dockerd startup'
+Assert-True ($DindPidCleanupIndex -ge 0) 'DinD removes a stale daemon PID file'
+Assert-True ($DindExecIndex -gt $DindPidCleanupIndex) 'DinD removes a stale PID before daemon exec'
+
 $XrdpStartWindowManager = [IO.File]::ReadAllText((Join-Path $RepoRoot 'templates\ubuntu-dind\xrdp_startwm.sh'))
 Assert-True (
     $XrdpStartWindowManager.Contains('export LANG="${LANG:-en_US.UTF-8}"')
